@@ -25,8 +25,81 @@ type ModelNotification = {
 };
 
 const NOTIFICATION_TTL_MS = 72 * 60 * 60 * 1000;
+const SETTINGS_STORAGE_KEY = "reactive-ai-settings-preferences";
+const MODEL_CATALOG_STORAGE_KEY = "reactive-ai-model-catalog";
+const MODEL_CATALOG_TTL_MS = 24 * 60 * 60 * 1000;
 
 const API_KEY_PATTERN = /^sk-or-[a-zA-Z0-9]{16,}$/;
+
+type PersistedSettingsState = {
+  apiKey: string;
+  selectedModelId: string;
+  webSearchEnabled: boolean;
+  maxTokens: number | "";
+  temperature: number | "";
+  repetitionPenalty: number | "";
+  topP: number | "";
+  topK: number | "";
+  reasoningLevel: "off" | "standard" | "deep";
+  knownModelIds: string[];
+  modelNotifications: ModelNotification[];
+};
+
+type PersistedModelCatalog = {
+  models: OpenRouterModel[];
+  lastFetchedAt: number | null;
+  storedAt: number;
+};
+
+const coerceNumericSetting = (value: unknown, fallback: number | ""): number | "" => {
+  if (value === "") {
+    return "";
+  }
+
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return value;
+  }
+
+  if (typeof value === "string" && value.trim()) {
+    const numeric = Number(value.trim());
+    if (!Number.isNaN(numeric) && Number.isFinite(numeric)) {
+      return numeric;
+    }
+  }
+
+  return fallback;
+};
+
+const sanitizeNotifications = (entries: unknown): ModelNotification[] => {
+  if (!Array.isArray(entries)) {
+    return [];
+  }
+
+  const now = Date.now();
+
+  return entries
+    .map((entry) => {
+      if (!entry || typeof entry !== "object") {
+        return null;
+      }
+
+      const candidate = entry as Partial<ModelNotification>;
+      if (
+        typeof candidate.id !== "string" ||
+        typeof candidate.name !== "string" ||
+        typeof candidate.timestamp !== "number"
+      ) {
+        return null;
+      }
+
+      if (!Number.isFinite(candidate.timestamp) || now - candidate.timestamp > NOTIFICATION_TTL_MS) {
+        return null;
+      }
+
+      return candidate as ModelNotification;
+    })
+    .filter((entry): entry is ModelNotification => Boolean(entry));
+};
 
 const formatPriceValue = (value?: number | string | null): string | undefined => {
   if (value === null || value === undefined) {
@@ -104,6 +177,8 @@ export default function SettingsPanel() {
   const [apiValidationStatus, setApiValidationStatus] = useState<
     { tone: "info" | "success" | "error"; message: string } | null
   >(null);
+  const [settingsHydrated, setSettingsHydrated] = useState(false);
+  const [catalogHydrated, setCatalogHydrated] = useState(false);
 
   useEffect(() => {
     const pruneNotifications = () => {
@@ -120,6 +195,190 @@ export default function SettingsPanel() {
       window.clearInterval(interval);
     };
   }, []);
+
+  useEffect(() => {
+    if (typeof window === "undefined") {
+      return;
+    }
+
+    try {
+      const stored = window.localStorage.getItem(SETTINGS_STORAGE_KEY);
+      if (!stored) {
+        return;
+      }
+
+      const parsed = JSON.parse(stored) as Partial<PersistedSettingsState> | null;
+      if (!parsed || typeof parsed !== "object") {
+        return;
+      }
+
+      if (typeof parsed.apiKey === "string") {
+        setApiKey(parsed.apiKey);
+      }
+
+      if (typeof parsed.selectedModelId === "string") {
+        setSelectedModelId(parsed.selectedModelId);
+      }
+
+      if (typeof parsed.webSearchEnabled === "boolean") {
+        setWebSearchEnabled(parsed.webSearchEnabled);
+      }
+
+      setMaxTokens((previous) => coerceNumericSetting(parsed.maxTokens, previous));
+      setTemperature((previous) => coerceNumericSetting(parsed.temperature, previous));
+      setRepetitionPenalty((previous) => coerceNumericSetting(parsed.repetitionPenalty, previous));
+      setTopP((previous) => coerceNumericSetting(parsed.topP, previous));
+      setTopK((previous) => coerceNumericSetting(parsed.topK, previous));
+
+      if (parsed.reasoningLevel === "off" || parsed.reasoningLevel === "standard" || parsed.reasoningLevel === "deep") {
+        setReasoningLevel(parsed.reasoningLevel);
+      }
+
+      if (Array.isArray(parsed.knownModelIds)) {
+        const storedKnownIds = parsed.knownModelIds;
+        setKnownModelIds(() => {
+          const entries = storedKnownIds.reduce<Record<string, true>>((accumulator, value) => {
+            if (typeof value === "string" && value.trim()) {
+              accumulator[value] = true;
+            }
+            return accumulator;
+          }, {});
+          return entries;
+        });
+      }
+
+      if (parsed.modelNotifications) {
+        setModelNotifications(sanitizeNotifications(parsed.modelNotifications));
+      }
+    } catch (error) {
+      console.error("Unable to restore settings preferences", error);
+    } finally {
+      setSettingsHydrated(true);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!settingsHydrated || typeof window === "undefined") {
+      return;
+    }
+
+    const payload: PersistedSettingsState = {
+      apiKey,
+      selectedModelId,
+      webSearchEnabled,
+      maxTokens,
+      temperature,
+      repetitionPenalty,
+      topP,
+      topK,
+      reasoningLevel,
+      knownModelIds: Object.keys(knownModelIds),
+      modelNotifications: sanitizeNotifications(modelNotifications),
+    };
+
+    try {
+      window.localStorage.setItem(SETTINGS_STORAGE_KEY, JSON.stringify(payload));
+    } catch (error) {
+      console.error("Unable to persist settings preferences", error);
+    }
+  }, [
+    apiKey,
+    knownModelIds,
+    maxTokens,
+    modelNotifications,
+    reasoningLevel,
+    repetitionPenalty,
+    selectedModelId,
+    settingsHydrated,
+    temperature,
+    topK,
+    topP,
+    webSearchEnabled,
+  ]);
+
+  useEffect(() => {
+    if (typeof window === "undefined") {
+      return;
+    }
+
+    try {
+      const stored = window.localStorage.getItem(MODEL_CATALOG_STORAGE_KEY);
+      if (!stored) {
+        return;
+      }
+
+      const parsed = JSON.parse(stored) as PersistedModelCatalog | null;
+      if (!parsed || typeof parsed !== "object") {
+        return;
+      }
+
+      if (typeof parsed.storedAt !== "number" || Date.now() - parsed.storedAt > MODEL_CATALOG_TTL_MS) {
+        return;
+      }
+
+      if (Array.isArray(parsed.models)) {
+        const normalized = parsed.models
+          .map((model) => {
+            if (!model || typeof model !== "object") {
+              return null;
+            }
+
+            const entry = model as OpenRouterModel;
+            if (typeof entry.id !== "string") {
+              return null;
+            }
+
+            return {
+              ...entry,
+              id: entry.id,
+            } satisfies OpenRouterModel;
+          })
+          .filter((entry): entry is OpenRouterModel => Boolean(entry));
+
+        if (normalized.length) {
+          normalized.sort((a, b) => a.id.localeCompare(b.id));
+          setModels(normalized);
+          setKnownModelIds((previous) => {
+            const merged = { ...previous };
+            for (const model of normalized) {
+              merged[model.id] = true;
+            }
+            return merged;
+          });
+        }
+      }
+
+      if (typeof parsed.lastFetchedAt === "number" && Number.isFinite(parsed.lastFetchedAt)) {
+        setLastFetchedAt(parsed.lastFetchedAt);
+      }
+    } catch (error) {
+      console.error("Unable to restore cached model catalog", error);
+    } finally {
+      setCatalogHydrated(true);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!catalogHydrated || typeof window === "undefined") {
+      return;
+    }
+
+    if (!models.length) {
+      return;
+    }
+
+    const payload: PersistedModelCatalog = {
+      models,
+      lastFetchedAt,
+      storedAt: Date.now(),
+    };
+
+    try {
+      window.localStorage.setItem(MODEL_CATALOG_STORAGE_KEY, JSON.stringify(payload));
+    } catch (error) {
+      console.error("Unable to persist model catalog", error);
+    }
+  }, [catalogHydrated, lastFetchedAt, models]);
 
   useEffect(() => {
     if (!isModelDropdownOpen) {
@@ -337,13 +596,14 @@ export default function SettingsPanel() {
     return modelNotifications.filter((entry) => now - entry.timestamp < NOTIFICATION_TTL_MS);
   }, [modelNotifications]);
 
-  const resolvedSelectedModelId = useMemo(() => {
+  const selectedModelLabel = useMemo(() => {
     if (!selectedModelId) {
-      return "";
+      return "Select a model";
     }
 
-    return filteredModels.some((model) => model.id === selectedModelId) ? selectedModelId : "";
-  }, [filteredModels, selectedModelId]);
+    const match = models.find((model) => model.id === selectedModelId);
+    return match?.name ?? selectedModelId;
+  }, [models, selectedModelId]);
 
   const toggleModelDropdown = useCallback(() => {
     setIsModelDropdownOpen((previous) => !previous);
@@ -443,11 +703,7 @@ export default function SettingsPanel() {
               aria-expanded={isModelDropdownOpen}
               aria-haspopup="listbox"
             >
-              <span className="model-dropdown__label">
-                {resolvedSelectedModelId
-                  ? models.find((model) => model.id === resolvedSelectedModelId)?.name ?? resolvedSelectedModelId
-                  : "Select a model"}
-              </span>
+              <span className="model-dropdown__label">{selectedModelLabel}</span>
               <span className="model-dropdown__count">{filteredModels.length} available</span>
             </button>
             {isModelDropdownOpen && (
@@ -467,7 +723,7 @@ export default function SettingsPanel() {
                         <button
                           type="button"
                           role="option"
-                          aria-selected={resolvedSelectedModelId === model.id}
+                          aria-selected={selectedModelId === model.id}
                           onClick={() => handleModelSelect(model.id)}
                         >
                           <span className="model-dropdown__option-name">{model.name ?? model.id}</span>
