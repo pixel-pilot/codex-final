@@ -18,13 +18,16 @@ export type GridRow = {
   len: number | null;
   lastUpdated: string;
   errorStatus: string;
+  inputTokens: number;
+  outputTokens: number;
+  costPerOutput: number;
 };
 
-const INITIAL_ROW_COUNT = 5000;
+export const INITIAL_ROW_COUNT = 5000;
 const ROW_HEIGHT = 40;
 const OVERSCAN = 8;
 const GRID_TEMPLATE =
-  "120px minmax(260px, 1fr) minmax(260px, 1fr) 80px 160px 160px";
+  "120px minmax(240px, 1fr) minmax(240px, 1fr) 90px 140px 160px 140px";
 
 const generateRowId = (): string => {
   if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
@@ -36,22 +39,68 @@ const generateRowId = (): string => {
 
 const createTimestamp = () => new Date().toISOString();
 
-const ensureRowInitialized = (row?: GridRow): GridRow => {
+const calculateTokenCount = (value: string) => {
+  if (!value) {
+    return 0;
+  }
+
+  return Math.max(1, Math.ceil(value.trim().split(/\s+/).length * 1.15));
+};
+
+const calculateCost = (inputTokens: number, outputTokens: number) => {
+  const totalTokens = inputTokens + outputTokens;
+  const unitCost = 0.000002;
+
+  return Number((totalTokens * unitCost).toFixed(4));
+};
+
+const withDerivedMetrics = (row: GridRow): GridRow => {
+  const inputTokens = calculateTokenCount(row.input);
+  const outputTokens = calculateTokenCount(row.output);
+  const costPerOutput = calculateCost(inputTokens, outputTokens);
+  const len = row.input ? row.input.length : row.output ? row.output.length : null;
+
+  return {
+    ...row,
+    inputTokens,
+    outputTokens,
+    costPerOutput,
+    len,
+  };
+};
+
+export const ensureRowInitialized = (row?: GridRow): GridRow => {
   const input = row?.input ?? "";
+  const output = row?.output ?? "";
+  const inputTokens = row?.inputTokens ?? calculateTokenCount(input);
+  const outputTokens = row?.outputTokens ?? calculateTokenCount(output);
 
   return {
     rowId: row?.rowId?.trim() ? row.rowId : generateRowId(),
     retries: typeof row?.retries === "number" ? row.retries : 0,
     status: row?.status?.trim() ? row.status : "Pending",
     input,
-    output: row?.output ?? "",
-    len: typeof row?.len === "number" ? row.len : input ? input.length : null,
+    output,
+    len:
+      typeof row?.len === "number"
+        ? row.len
+        : input
+            ? input.length
+            : output
+              ? output.length
+              : null,
     lastUpdated: row?.lastUpdated ?? "",
     errorStatus: row?.errorStatus ?? "",
+    inputTokens,
+    outputTokens,
+    costPerOutput: row?.costPerOutput ?? calculateCost(inputTokens, outputTokens),
   };
 };
 
-const createRow = (): GridRow => ensureRowInitialized();
+export const createRow = (): GridRow => ensureRowInitialized();
+
+export const createInitialRows = (count: number): GridRow[] =>
+  Array.from({ length: count }, () => createRow());
 
 const parseClipboardText = (text: string): string[] => {
   const normalized = text.replace(/\r/g, "");
@@ -68,10 +117,12 @@ const parseClipboardText = (text: string): string[] => {
   return lines.map((line) => line.split("\t")[0] ?? "");
 };
 
-export function CoreGrid() {
-  const [rows, setRows] = useState<GridRow[]>(() =>
-    Array.from({ length: INITIAL_ROW_COUNT }, () => createRow()),
-  );
+type CoreGridProps = {
+  rows: GridRow[];
+  setRows: React.Dispatch<React.SetStateAction<GridRow[]>>;
+};
+
+export function CoreGrid({ rows, setRows }: CoreGridProps) {
   const [activeRow, setActiveRow] = useState<number | null>(null);
   const [scrollTop, setScrollTop] = useState(0);
   const [viewportHeight, setViewportHeight] = useState(400);
@@ -139,18 +190,23 @@ export function CoreGrid() {
           const nextTimestamp = shouldResetStatus
             ? createTimestamp()
             : normalized.lastUpdated;
-          const updated: GridRow = {
+          const updated: GridRow = withDerivedMetrics({
             ...normalized,
             input: nextInput,
             status: shouldResetStatus ? "Pending" : normalized.status,
             len: nextLen,
             lastUpdated: nextTimestamp,
-          };
+          });
 
           if (
             shouldResetStatus ||
+            normalized.input !== updated.input ||
+            normalized.status !== updated.status ||
             normalized.len !== updated.len ||
-            normalized.lastUpdated !== updated.lastUpdated
+            normalized.lastUpdated !== updated.lastUpdated ||
+            normalized.inputTokens !== updated.inputTokens ||
+            normalized.outputTokens !== updated.outputTokens ||
+            normalized.costPerOutput !== updated.costPerOutput
           ) {
             mutated = true;
           }
@@ -161,7 +217,7 @@ export function CoreGrid() {
         return mutated ? next : previous;
       });
     },
-    [],
+    [setRows],
   );
 
   const handleInputChange = useCallback(
@@ -180,13 +236,13 @@ export function CoreGrid() {
         const nextTimestamp = shouldResetStatus
           ? createTimestamp()
           : normalized.lastUpdated;
-        const updated: GridRow = {
+        const updated: GridRow = withDerivedMetrics({
           ...normalized,
           input: nextInput,
           status: shouldResetStatus ? "Pending" : normalized.status,
           len: nextLen,
           lastUpdated: nextTimestamp,
-        };
+        });
 
         const createdRow = rowIndex >= previous.length;
 
@@ -195,6 +251,9 @@ export function CoreGrid() {
           normalized.input === updated.input &&
           normalized.len === updated.len &&
           normalized.lastUpdated === updated.lastUpdated &&
+          normalized.inputTokens === updated.inputTokens &&
+          normalized.outputTokens === updated.outputTokens &&
+          normalized.costPerOutput === updated.costPerOutput &&
           !createdRow
         ) {
           return previous;
@@ -204,7 +263,7 @@ export function CoreGrid() {
         return next;
       });
     },
-    [],
+    [setRows],
   );
 
   const handlePaste = useCallback(
@@ -246,7 +305,7 @@ export function CoreGrid() {
         setActiveRow(rowIndex - 1);
       }
     },
-    [],
+    [setRows],
   );
 
   useEffect(() => {
@@ -301,7 +360,15 @@ export function CoreGrid() {
   const totalHeight = rows.length * ROW_HEIGHT;
 
   const columnHeaders = useMemo(
-    () => ["Status", "Input", "Output", "Len", "Last Updated", "Error Status"],
+    () => [
+      "Status",
+      "Input",
+      "Output",
+      "Len",
+      "Last Updated",
+      "Error Status",
+      "Cost / Output",
+    ],
     [],
   );
 
@@ -411,6 +478,13 @@ export function CoreGrid() {
                   aria-colindex={6}
                 >
                   {row.errorStatus}
+                </div>
+                <div
+                  className="grid-cell grid-cell--numeric"
+                  role="gridcell"
+                  aria-colindex={7}
+                >
+                  {row.costPerOutput ? `$${row.costPerOutput.toFixed(4)}` : "—"}
                 </div>
               </div>
             );
