@@ -753,6 +753,61 @@ body {
   color: #64748b;
 }
 
+.usage-qa-status {
+  margin-top: 32px;
+  padding: 24px;
+  border: 1px solid var(--border-color);
+  border-radius: 12px;
+  background: var(--metric-background);
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.usage-qa-status__header {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 12px;
+}
+
+.usage-qa-status__header time {
+  font-size: 0.85rem;
+  color: #475569;
+}
+
+.usage-qa-status__metrics {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+  gap: 12px;
+  margin: 0;
+}
+
+.usage-qa-status__metric {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.usage-qa-status__metric dt {
+  font-size: 0.85rem;
+  color: #475569;
+  margin: 0;
+  text-transform: capitalize;
+}
+
+.usage-qa-status__metric dd {
+  margin: 0;
+  font-size: 1.15rem;
+  font-weight: 600;
+}
+
+.usage-qa-status__note {
+  margin: 0;
+  font-size: 0.9rem;
+  color: #475569;
+}
+
 @media (max-width: 768px) {
   .grid-page-shell {
     padding: 24px 16px;
