@@ -1,3 +1,5 @@
+"use client";
+
 import type { UpdateRecord } from "./updatesRepository";
 import { loadState, saveState, subscribeToState } from "./appStateRepository";
 

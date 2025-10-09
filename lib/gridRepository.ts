@@ -1,3 +1,5 @@
+"use client";
+
 import type { ColumnWidths, GridRow } from "../app/components/CoreGrid";
 import { ensureRowInitialized } from "../app/components/CoreGrid";
 import { loadState, saveState, subscribeToState } from "./appStateRepository";

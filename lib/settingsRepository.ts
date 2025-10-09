@@ -1,3 +1,5 @@
+"use client";
+
 import { loadState, saveState, subscribeToState } from "./appStateRepository";
 
 export type OpenRouterModel = {
