@@ -25,27 +25,6 @@ const MODEL_CATALOG_TTL_MS = 24 * 60 * 60 * 1000;
 
 const API_KEY_PATTERN = /^sk-or-[a-zA-Z0-9]{16,}$/;
 
-type PersistedSettingsState = {
-  apiKey: string;
-  selectedModelId: string;
-  webSearchEnabled: boolean;
-  maxTokens: number | "";
-  temperature: number | "";
-  repetitionPenalty: number | "";
-  topP: number | "";
-  topK: number | "";
-  reasoningLevel: "off" | "standard" | "deep";
-  rateLimitPerMinute: number | "";
-  knownModelIds: string[];
-  modelNotifications: ModelNotification[];
-};
-
-type PersistedModelCatalog = {
-  models: OpenRouterModel[];
-  lastFetchedAt: number | null;
-  storedAt: number;
-};
-
 const coerceNumericSetting = (value: unknown, fallback: number | ""): number | "" => {
   if (value === "") {
     return "";
