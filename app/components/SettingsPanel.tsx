@@ -25,7 +25,7 @@ type ModelNotification = {
 };
 
 const NOTIFICATION_TTL_MS = 72 * 60 * 60 * 1000;
-const SETTINGS_STORAGE_KEY = "reactive-ai-settings-preferences";
+export const SETTINGS_STORAGE_KEY = "reactive-ai-settings-preferences";
 const MODEL_CATALOG_STORAGE_KEY = "reactive-ai-model-catalog";
 const MODEL_CATALOG_TTL_MS = 24 * 60 * 60 * 1000;
 
@@ -41,6 +41,7 @@ type PersistedSettingsState = {
   topP: number | "";
   topK: number | "";
   reasoningLevel: "off" | "standard" | "deep";
+  rateLimitPerMinute: number | "";
   knownModelIds: string[];
   modelNotifications: ModelNotification[];
 };
@@ -171,6 +172,7 @@ export default function SettingsPanel() {
   const [topP, setTopP] = useState<number | "">(0.9);
   const [topK, setTopK] = useState<number | "">(40);
   const [reasoningLevel, setReasoningLevel] = useState<"off" | "standard" | "deep">("off");
+  const [rateLimitPerMinute, setRateLimitPerMinute] = useState<number | "">(120);
   const [isModelDropdownOpen, setIsModelDropdownOpen] = useState(false);
   const dropdownRef = useRef<HTMLDivElement | null>(null);
   const [isValidatingApiKey, setIsValidatingApiKey] = useState(false);
@@ -179,6 +181,7 @@ export default function SettingsPanel() {
   >(null);
   const [settingsHydrated, setSettingsHydrated] = useState(false);
   const [catalogHydrated, setCatalogHydrated] = useState(false);
+  const [areNotificationsOpen, setAreNotificationsOpen] = useState(false);
 
   useEffect(() => {
     const pruneNotifications = () => {
@@ -234,6 +237,8 @@ export default function SettingsPanel() {
         setReasoningLevel(parsed.reasoningLevel);
       }
 
+      setRateLimitPerMinute((previous) => coerceNumericSetting(parsed.rateLimitPerMinute, previous));
+
       if (Array.isArray(parsed.knownModelIds)) {
         const storedKnownIds = parsed.knownModelIds;
         setKnownModelIds(() => {
@@ -272,6 +277,7 @@ export default function SettingsPanel() {
       topP,
       topK,
       reasoningLevel,
+      rateLimitPerMinute,
       knownModelIds: Object.keys(knownModelIds),
       modelNotifications: sanitizeNotifications(modelNotifications),
     };
@@ -286,6 +292,7 @@ export default function SettingsPanel() {
     knownModelIds,
     maxTokens,
     modelNotifications,
+    rateLimitPerMinute,
     reasoningLevel,
     repetitionPenalty,
     selectedModelId,
@@ -411,23 +418,20 @@ export default function SettingsPanel() {
   }, [isModelDropdownOpen]);
 
   const apiKeyStatus = useMemo(() => {
-    if (!apiKey.trim()) {
+    const trimmed = apiKey.trim();
+    if (!trimmed) {
       return {
         type: "info" as const,
-        message: "Provide your OpenRouter API key to authenticate requests.",
+        message: "Provide your API key to authenticate requests.",
+        showCheckmark: false,
       };
     }
 
-    if (API_KEY_PATTERN.test(apiKey.trim())) {
-      return {
-        type: "success" as const,
-        message: "API key format looks valid.",
-      };
-    }
-
+    const isOpenRouterKey = API_KEY_PATTERN.test(trimmed);
     return {
-      type: "error" as const,
-      message: "OpenRouter API keys begin with sk-or- followed by at least 16 alphanumeric characters.",
+      type: "success" as const,
+      message: isOpenRouterKey ? "OpenRouter API key detected." : "API key stored.",
+      showCheckmark: true,
     };
   }, [apiKey]);
 
@@ -628,6 +632,34 @@ export default function SettingsPanel() {
     setter(numeric);
   }, []);
 
+  const handleRateLimitChange = useCallback((value: string) => {
+    if (!value.trim()) {
+      setRateLimitPerMinute("");
+      return;
+    }
+
+    const numeric = Number(value);
+    if (Number.isNaN(numeric)) {
+      return;
+    }
+
+    const bounded = Math.min(Math.max(Math.round(numeric), 1), 250);
+    setRateLimitPerMinute(bounded);
+  }, []);
+
+  useEffect(() => {
+    if (typeof window === "undefined") {
+      return;
+    }
+
+    const detailValue = typeof rateLimitPerMinute === "number" ? rateLimitPerMinute : null;
+    window.dispatchEvent(
+      new CustomEvent("reactive-ai:settings-rate-limit-changed", {
+        detail: { value: detailValue },
+      }),
+    );
+  }, [rateLimitPerMinute]);
+
   return (
     <div className="settings-panel" role="form" aria-describedby="settings-panel-description">
       <p id="settings-panel-description" className="visually-subtle">
@@ -655,17 +687,32 @@ export default function SettingsPanel() {
             inputMode="text"
             autoComplete="off"
             value={apiKey}
-            onChange={(event) => setApiKey(event.currentTarget.value)}
+            onChange={(event) => {
+              setApiKey(event.currentTarget.value);
+              if (apiValidationStatus) {
+                setApiValidationStatus(null);
+              }
+            }}
             placeholder="sk-or-..."
             aria-describedby="openrouter-api-key-status"
           />
-          <p
+          <div
             id="openrouter-api-key-status"
-            className={`settings-field__message settings-field__message--${apiKeyStatus.type}`}
-            role={apiKeyStatus.type === "error" ? "alert" : undefined}
+            className={`settings-field__status settings-field__status--${apiKeyStatus.type}`}
+            role="status"
+            aria-live="polite"
           >
-            {apiKeyStatus.message}
-          </p>
+            {apiKeyStatus.showCheckmark ? (
+              <>
+                <span className="settings-field__status-icon" aria-hidden="true">
+                  ✓
+                </span>
+                <span className="sr-only">{apiKeyStatus.message}</span>
+              </>
+            ) : (
+              <span>{apiKeyStatus.message}</span>
+            )}
+          </div>
           {apiValidationStatus && (
             <p
               className={`settings-field__message settings-field__message--${apiValidationStatus.tone}`}
@@ -680,19 +727,38 @@ export default function SettingsPanel() {
       <section className="settings-card settings-card--model" aria-labelledby="text-models-heading">
         <div className="settings-card__header settings-card__header--compact">
           <div>
-            <h2 id="text-models-heading">Model configuration</h2>
+            <h2 id="text-models-heading">Select Model</h2>
             <p className="settings-card__description">
               Browse the OpenRouter catalog, compare pricing, and adjust inference parameters side by side.
             </p>
           </div>
-          <button
-            type="button"
-            className="settings-action-button"
-            onClick={handleFetchModels}
-            disabled={isFetchingModels}
-          >
-            {isFetchingModels ? "Fetching…" : "Refresh catalog"}
-          </button>
+          <div className="model-actions" role="group" aria-label="Model utilities">
+            <button
+              type="button"
+              className="settings-action-button"
+              onClick={handleFetchModels}
+              disabled={isFetchingModels}
+            >
+              {isFetchingModels ? "Fetching…" : "Refresh Models"}
+            </button>
+            <div className="model-actions__toggle">
+              <label className="model-actions__toggle-control">
+                <span className="model-actions__toggle-text">Web Search</span>
+                <span className="toggle-switch">
+                  <input
+                    type="checkbox"
+                    checked={webSearchEnabled}
+                    onChange={(event) => setWebSearchEnabled(event.currentTarget.checked)}
+                    aria-label="Enable OpenRouter web search augmentation"
+                  />
+                  <span className="toggle-switch__slider" aria-hidden="true" />
+                </span>
+              </label>
+              <p className="settings-field__hint model-actions__hint">
+                When enabled, requests append <code>:online</code> so supported models use OpenRouter web search augmentation.
+              </p>
+            </div>
+          </div>
         </div>
         <div className="model-config">
           <div className="model-dropdown" ref={dropdownRef}>
@@ -752,11 +818,11 @@ export default function SettingsPanel() {
               </div>
             )}
           </div>
-          <div className="model-parameters">
-            <div className="settings-parameter-grid">
-              <div className="settings-field">
-                <label htmlFor="max-tokens">Max Tokens</label>
-                <input
+            <div className="model-parameters">
+              <div className="settings-parameter-grid">
+                <div className="settings-field">
+                  <label htmlFor="max-tokens">Max Tokens</label>
+                  <input
                   id="max-tokens"
                   type="number"
                   min={1}
@@ -812,6 +878,19 @@ export default function SettingsPanel() {
                 />
               </div>
               <div className="settings-field">
+                <label htmlFor="rate-limit">Rate Limit (requests / min)</label>
+                <input
+                  id="rate-limit"
+                  type="number"
+                  min={1}
+                  max={250}
+                  step={1}
+                  value={rateLimitPerMinute}
+                  onChange={(event) => handleRateLimitChange(event.currentTarget.value)}
+                />
+                <p className="settings-field__hint">Choose how many requests per minute the generator should target (1–250).</p>
+              </div>
+              <div className="settings-field">
                 <label htmlFor="reasoning-level">Reasoning Effort Level</label>
                 <select
                   id="reasoning-level"
@@ -836,36 +915,34 @@ export default function SettingsPanel() {
           </p>
         )}
         {activeNotifications.length > 0 && (
-          <div className="settings-notifications" role="status" aria-live="polite">
-            <h3>Recently added models</h3>
-            <ul>
-              {activeNotifications.map((notification) => (
-                <li key={`${notification.id}-${notification.timestamp}`}>
-                  <span className="settings-notifications__model">{notification.name}</span>
-                  <time dateTime={new Date(notification.timestamp).toISOString()}>
-                    Added {formatTimestamp(notification.timestamp)}
-                  </time>
-                </li>
-              ))}
-            </ul>
+          <div className="settings-notifications" role="region" aria-live="polite">
+            <button
+              type="button"
+              className="settings-notifications__toggle"
+              onClick={() => setAreNotificationsOpen((previous) => !previous)}
+              aria-expanded={areNotificationsOpen}
+              aria-controls="recent-model-notifications"
+            >
+              <span>Recently added models</span>
+              <span className="settings-notifications__badge">{activeNotifications.length}</span>
+              <span className="settings-notifications__chevron" aria-hidden="true">
+                {areNotificationsOpen ? "▾" : "▸"}
+              </span>
+            </button>
+            {areNotificationsOpen && (
+              <ul id="recent-model-notifications">
+                {activeNotifications.map((notification) => (
+                  <li key={`${notification.id}-${notification.timestamp}`}>
+                    <span className="settings-notifications__model">{notification.name}</span>
+                    <time dateTime={new Date(notification.timestamp).toISOString()}>
+                      Added {formatTimestamp(notification.timestamp)}
+                    </time>
+                  </li>
+                ))}
+              </ul>
+            )}
           </div>
         )}
-        <div className="settings-toggle">
-          <span>Web Search</span>
-          <label className="toggle-switch">
-            <input
-              type="checkbox"
-              checked={webSearchEnabled}
-              onChange={(event) => setWebSearchEnabled(event.currentTarget.checked)}
-              aria-label="Enable OpenRouter web search augmentation"
-            />
-            <span className="toggle-switch__slider" aria-hidden="true" />
-          </label>
-          <p className="settings-field__hint">
-            When enabled, requests will append <code>:online</code> to supported models so they use OpenRouter web
-            search augmentation.
-          </p>
-        </div>
       </section>
     </div>
   );
