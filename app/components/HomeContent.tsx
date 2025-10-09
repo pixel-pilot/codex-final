@@ -10,13 +10,15 @@ import CoreGrid, {
   DEFAULT_COLUMN_WIDTHS,
 } from "./CoreGrid";
 import SettingsPanel from "./SettingsPanel";
+import UpdatesPanel from "./UpdatesPanel";
 
-type TabId = "generate" | "settings" | "usage";
+type TabId = "generate" | "settings" | "usage" | "updates";
 
 const TABS: { id: TabId; label: string }[] = [
   { id: "generate", label: "Generate" },
   { id: "settings", label: "Settings" },
   { id: "usage", label: "Usage & Costs" },
+  { id: "updates", label: "Updates" },
 ];
 
 type UsageEntry = {
@@ -1270,6 +1272,11 @@ export default function HomeContent() {
         </section>
       )}
       {activeTab === "usage" && renderUsageView()}
+      {activeTab === "updates" && (
+        <section className="updates-container" aria-label="Recent application updates">
+          <UpdatesPanel />
+        </section>
+      )}
     </main>
   );
 }
