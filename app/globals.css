@@ -431,12 +431,15 @@ body {
   border-radius: 12px;
   background: var(--metric-background);
   border: 1px solid var(--border-color);
+  align-items: center;
+  text-align: center;
 }
 
 .generate-metric__label,
 .usage-metric__label {
   font-size: 0.85rem;
   color: #64748b;
+  text-align: center;
 }
 
 .generate-metric__value,
@@ -445,6 +448,20 @@ body {
   font-weight: 600;
   color: #0f172a;
   font-variant-numeric: tabular-nums;
+}
+
+.generate-metric__value {
+  display: inline-flex;
+  align-items: baseline;
+  justify-content: center;
+  gap: 0.35rem;
+}
+
+.generate-metric__percentage {
+  font-size: 0.95rem;
+  font-weight: 500;
+  color: inherit;
+  opacity: 0.85;
 }
 
 .generate-helper {
