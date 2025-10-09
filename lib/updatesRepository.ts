@@ -1,3 +1,5 @@
+"use client";
+
 import { getSupabaseClient } from "./supabaseClient";
 
 export type UpdateRecord = {
@@ -118,10 +120,18 @@ const normalizeRows = (rows: UpdateRow[] | null | undefined): UpdateRecord[] =>
     author: row.author,
   }));
 
+const requireSupabaseClient = () => {
+  if (typeof getSupabaseClient !== "function") {
+    throw new Error("Supabase client helper is unavailable in the browser bundle.");
+  }
+
+  return getSupabaseClient();
+};
+
 export const listUpdates = async (
   params: ListUpdatesParams = {}
 ): Promise<ListUpdatesResult> => {
-  const client = getSupabaseClient();
+  const client = requireSupabaseClient();
 
   const query = client.from(TABLE_NAME).select(SELECT_FIELDS);
 
@@ -144,7 +154,7 @@ export const listUpdates = async (
 };
 
 export const upsertUpdate = async (entry: UpdateRecord): Promise<void> => {
-  const client = getSupabaseClient();
+  const client = requireSupabaseClient();
 
   const { error } = await client.from(TABLE_NAME).upsert(entry, {
     onConflict: "id",
@@ -155,8 +165,10 @@ export const upsertUpdate = async (entry: UpdateRecord): Promise<void> => {
   }
 };
 
-export const listUpdatesSince = async (timestamp: string): Promise<UpdateRecord[]> => {
-  const client = getSupabaseClient();
+export const listUpdatesSince = async (
+  timestamp: string,
+): Promise<UpdateRecord[]> => {
+  const client = requireSupabaseClient();
 
   const { data, error } = await client
     .from(TABLE_NAME)

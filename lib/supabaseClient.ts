@@ -1,6 +1,24 @@
+"use client";
+
 import { createClient, SupabaseClient } from "@supabase/supabase-js";
 
-let client: SupabaseClient | null = null;
+type SupabaseClientCache = {
+  browserSupabaseClient?: SupabaseClient;
+};
+
+const globalCache = globalThis as typeof globalThis & SupabaseClientCache;
+
+const getCachedClient = (): SupabaseClient | null => {
+  if (globalCache.browserSupabaseClient) {
+    return globalCache.browserSupabaseClient;
+  }
+
+  return null;
+};
+
+const cacheClient = (client: SupabaseClient): void => {
+  globalCache.browserSupabaseClient = client;
+};
 
 export const getSupabaseClient = (): SupabaseClient => {
   const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
@@ -18,11 +36,17 @@ export const getSupabaseClient = (): SupabaseClient => {
     );
   }
 
-  if (!client) {
-    client = createClient(url, anonKey, {
-      auth: { persistSession: false },
-    });
+  const existing = getCachedClient();
+
+  if (existing) {
+    return existing;
   }
+
+  const client = createClient(url, anonKey, {
+    auth: { persistSession: false },
+  });
+
+  cacheClient(client);
 
   return client;
 };

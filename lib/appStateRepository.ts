@@ -1,3 +1,5 @@
+"use client";
+
 import type { RealtimeChannel } from "@supabase/supabase-js";
 import { getSupabaseClient } from "./supabaseClient";
 
@@ -11,8 +13,16 @@ type AppStateRow<T> = {
 
 const buildChannelName = (key: string) => `${TABLE_NAME}:${key}`;
 
+const requireSupabaseClient = () => {
+  if (typeof getSupabaseClient !== "function") {
+    throw new Error("Supabase client helper is unavailable in the browser bundle.");
+  }
+
+  return getSupabaseClient();
+};
+
 export const loadState = async <T>(key: string): Promise<T | null> => {
-  const client = getSupabaseClient();
+  const client = requireSupabaseClient();
 
   const { data, error } = await client
     .from(TABLE_NAME)
@@ -30,7 +40,7 @@ export const loadState = async <T>(key: string): Promise<T | null> => {
 };
 
 export const saveState = async <T>(key: string, payload: T): Promise<void> => {
-  const client = getSupabaseClient();
+  const client = requireSupabaseClient();
 
   const { error } = await client.from(TABLE_NAME).upsert(
     { key, payload } satisfies AppStateRow<T>,
@@ -48,7 +58,7 @@ export const subscribeToState = <T>(
   key: string,
   handler: (payload: T | null) => void,
 ): (() => void) => {
-  const client = getSupabaseClient();
+  const client = requireSupabaseClient();
 
   let channel: RealtimeChannel | null = null;
 
