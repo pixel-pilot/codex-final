@@ -7,7 +7,12 @@ import {
   useRef,
   useState,
 } from "react";
-import type { ClipboardEvent, CSSProperties, KeyboardEvent } from "react";
+import type {
+  ClipboardEvent,
+  CSSProperties,
+  KeyboardEvent,
+  MouseEvent as ReactMouseEvent,
+} from "react";
 
 export type GridRow = {
   rowId: string;
@@ -26,8 +31,46 @@ export type GridRow = {
 export const INITIAL_ROW_COUNT = 5000;
 const ROW_HEIGHT = 40;
 const OVERSCAN = 8;
-const GRID_TEMPLATE =
-  "120px minmax(240px, 1fr) minmax(240px, 1fr) 90px 140px 160px 140px";
+export const DEFAULT_COLUMN_WIDTHS = {
+  select: 48,
+  status: 120,
+  input: 320,
+  output: 320,
+  len: 90,
+  lastUpdated: 160,
+  errorStatus: 180,
+  costPerOutput: 150,
+} as const;
+
+const MIN_COLUMN_WIDTHS: ColumnWidths = {
+  select: 44,
+  status: 100,
+  input: 220,
+  output: 220,
+  len: 72,
+  lastUpdated: 140,
+  errorStatus: 140,
+  costPerOutput: 120,
+};
+
+export type ColumnId = keyof typeof DEFAULT_COLUMN_WIDTHS;
+
+export type ColumnWidths = Record<ColumnId, number>;
+
+const columnDefinition: Array<{
+  id: ColumnId;
+  label: string;
+  align?: "start" | "center" | "end";
+}> = [
+  { id: "select", label: "", align: "center" },
+  { id: "status", label: "Status" },
+  { id: "input", label: "Input" },
+  { id: "output", label: "Output" },
+  { id: "len", label: "Len", align: "end" },
+  { id: "lastUpdated", label: "Last Updated" },
+  { id: "errorStatus", label: "Error Status" },
+  { id: "costPerOutput", label: "Cost / Output", align: "end" },
+];
 
 const generateRowId = (): string => {
   if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
@@ -120,15 +163,48 @@ const parseClipboardText = (text: string): string[] => {
 type CoreGridProps = {
   rows: GridRow[];
   setRows: React.Dispatch<React.SetStateAction<GridRow[]>>;
+  displayedRowIndices: number[];
+  selectedRowIds: Set<string>;
+  onToggleRowSelection: (rowId: string, selected: boolean) => void;
+  onToggleSelectAll: (rowIds: string[], selected: boolean) => void;
+  columnWidths: ColumnWidths;
+  onColumnWidthChange: (columnId: ColumnId, width: number) => void;
 };
 
-export function CoreGrid({ rows, setRows }: CoreGridProps) {
+export function CoreGrid({
+  rows,
+  setRows,
+  displayedRowIndices,
+  selectedRowIds,
+  onToggleRowSelection,
+  onToggleSelectAll,
+  columnWidths,
+  onColumnWidthChange,
+}: CoreGridProps) {
+  const totalRowCount = rows.length;
   const [activeRow, setActiveRow] = useState<number | null>(null);
   const [scrollTop, setScrollTop] = useState(0);
   const [viewportHeight, setViewportHeight] = useState(400);
 
   const containerRef = useRef<HTMLDivElement | null>(null);
-  const inputRefs = useRef(new Map<number, HTMLTextAreaElement>());
+  const inputRefs = useRef(new Map<string, HTMLTextAreaElement>());
+  const resizeStateRef = useRef<{
+    columnId: ColumnId;
+    startX: number;
+    startWidth: number;
+  } | null>(null);
+
+  const normalizedColumnWidths: ColumnWidths = useMemo(() => {
+    const resolved: Partial<ColumnWidths> = {};
+    for (const { id } of columnDefinition) {
+      const candidate = columnWidths[id];
+      const min = MIN_COLUMN_WIDTHS[id];
+      const fallback = DEFAULT_COLUMN_WIDTHS[id];
+      const width = Number.isFinite(candidate) ? Number(candidate) : fallback;
+      resolved[id] = Math.max(min, width);
+    }
+    return resolved as ColumnWidths;
+  }, [columnWidths]);
 
   useEffect(() => {
     const container = containerRef.current;
@@ -267,7 +343,7 @@ export function CoreGrid({ rows, setRows }: CoreGridProps) {
   );
 
   const handlePaste = useCallback(
-    (event: ClipboardEvent<HTMLTextAreaElement>, rowIndex: number) => {
+    (event: ClipboardEvent<HTMLTextAreaElement>, filteredRowIndex: number) => {
       event.preventDefault();
       const clipboardText = event.clipboardData?.getData("text") ?? "";
       const values = parseClipboardText(clipboardText);
@@ -275,38 +351,87 @@ export function CoreGrid({ rows, setRows }: CoreGridProps) {
         return;
       }
 
-      updateRowRange(rowIndex, values);
-      setActiveRow(rowIndex);
+      const actualIndex =
+        displayedRowIndices[filteredRowIndex] ?? Math.max(totalRowCount, 0);
+      updateRowRange(actualIndex, values);
+      setActiveRow(filteredRowIndex);
     },
-    [updateRowRange],
+    [displayedRowIndices, totalRowCount, updateRowRange],
   );
 
-  const handleFocus = useCallback((rowIndex: number) => {
-    setActiveRow(rowIndex);
+  const handleFocus = useCallback((filteredRowIndex: number) => {
+    setActiveRow(filteredRowIndex);
   }, []);
 
   const handleKeyDown = useCallback(
-    (event: KeyboardEvent<HTMLTextAreaElement>, rowIndex: number) => {
+    (event: KeyboardEvent<HTMLTextAreaElement>, filteredRowIndex: number) => {
       if (event.key === "ArrowDown") {
         event.preventDefault();
+        const actualIndex =
+          displayedRowIndices[filteredRowIndex] ?? totalRowCount - 1;
         setRows((previous) => {
-          if (rowIndex >= previous.length - 1) {
+          if (actualIndex >= previous.length - 1) {
             return [...previous, createRow()];
           }
 
           return previous;
         });
-        setActiveRow(rowIndex + 1);
+        const nextIndex = Math.min(
+          filteredRowIndex + 1,
+          Math.max(displayedRowIndices.length - 1, 0),
+        );
+        setActiveRow(nextIndex);
       } else if (event.key === "ArrowUp") {
-        if (rowIndex === 0) {
+        if (filteredRowIndex === 0) {
           return;
         }
         event.preventDefault();
-        setActiveRow(rowIndex - 1);
+        setActiveRow(Math.max(0, filteredRowIndex - 1));
       }
     },
-    [setRows],
+    [displayedRowIndices, setRows, totalRowCount],
   );
+
+  useEffect(() => {
+    const container = containerRef.current;
+    if (container) {
+      setScrollTop(container.scrollTop);
+    }
+  }, []);
+
+  const displayedRows = useMemo(() => {
+    return displayedRowIndices
+      .map((index) => rows[index])
+      .filter((row): row is GridRow => Boolean(row))
+      .map((row) => ensureRowInitialized(row));
+  }, [displayedRowIndices, rows]);
+
+  const gridTemplate = useMemo(() => {
+    return columnDefinition
+      .map(({ id }) => `${normalizedColumnWidths[id]}px`)
+      .join(" ");
+  }, [normalizedColumnWidths]);
+
+  const totalHeight = displayedRows.length * ROW_HEIGHT;
+
+  const { startIndex, endIndex } = useMemo(() => {
+    const start = Math.max(0, Math.floor(scrollTop / ROW_HEIGHT) - OVERSCAN);
+    const end = Math.min(
+      displayedRows.length,
+      Math.ceil((scrollTop + viewportHeight) / ROW_HEIGHT) + OVERSCAN,
+    );
+
+    return { startIndex: start, endIndex: end };
+  }, [displayedRows.length, scrollTop, viewportHeight]);
+
+  const visibleRows = displayedRows.slice(startIndex, endIndex);
+
+  const activeRowId = useMemo(() => {
+    if (activeRow == null || activeRow < 0 || activeRow >= displayedRows.length) {
+      return null;
+    }
+    return displayedRows[activeRow]?.rowId ?? null;
+  }, [activeRow, displayedRows]);
 
   useEffect(() => {
     const container = containerRef.current;
@@ -329,7 +454,7 @@ export function CoreGrid({ rows, setRows }: CoreGridProps) {
       container.scrollTo({ top: rowBottom - container.clientHeight });
     }
 
-    const input = inputRefs.current.get(activeRow);
+    const input = activeRowId ? inputRefs.current.get(activeRowId) : null;
     if (input && document.activeElement !== input) {
       requestAnimationFrame(() => {
         input.focus();
@@ -337,70 +462,104 @@ export function CoreGrid({ rows, setRows }: CoreGridProps) {
         input.setSelectionRange(length, length);
       });
     }
-  }, [activeRow]);
-
-  useEffect(() => {
-    const container = containerRef.current;
-    if (container) {
-      setScrollTop(container.scrollTop);
-    }
-  }, []);
-
-  const { startIndex, endIndex } = useMemo(() => {
-    const start = Math.max(0, Math.floor(scrollTop / ROW_HEIGHT) - OVERSCAN);
-    const end = Math.min(
-      rows.length,
-      Math.ceil((scrollTop + viewportHeight) / ROW_HEIGHT) + OVERSCAN,
-    );
-
-    return { startIndex: start, endIndex: end };
-  }, [scrollTop, viewportHeight, rows.length]);
-
-  const visibleRows = rows.slice(startIndex, endIndex);
-  const totalHeight = rows.length * ROW_HEIGHT;
-
-  const columnHeaders = useMemo(
-    () => [
-      "Status",
-      "Input",
-      "Output",
-      "Len",
-      "Last Updated",
-      "Error Status",
-      "Cost / Output",
-    ],
-    [],
-  );
+  }, [activeRow, activeRowId]);
 
   const gridStyle = useMemo(
     () =>
       ({
-        "--grid-template-columns": GRID_TEMPLATE,
+        "--grid-template-columns": gridTemplate,
         "--grid-row-height": `${ROW_HEIGHT}px`,
       }) as CSSProperties,
-    [],
+    [gridTemplate],
   );
+
+  const isAllVisibleSelected = useMemo(() => {
+    if (!displayedRows.length) {
+      return false;
+    }
+    return displayedRows.every((row) => selectedRowIds.has(row.rowId));
+  }, [displayedRows, selectedRowIds]);
+
+  const handleResizeStart = useCallback(
+    (columnId: ColumnId, event: ReactMouseEvent<HTMLSpanElement>) => {
+      event.preventDefault();
+      const startX = event.clientX;
+      const startWidth = normalizedColumnWidths[columnId] ?? DEFAULT_COLUMN_WIDTHS[columnId];
+      resizeStateRef.current = { columnId, startX, startWidth };
+
+      const handleMove = (moveEvent: MouseEvent) => {
+        const state = resizeStateRef.current;
+        if (!state || state.columnId !== columnId) {
+          return;
+        }
+        const delta = moveEvent.clientX - state.startX;
+        const proposed = state.startWidth + delta;
+        const min = MIN_COLUMN_WIDTHS[columnId];
+        const bounded = Math.max(min, proposed);
+        onColumnWidthChange(columnId, Math.round(bounded));
+      };
+
+      const handleUp = () => {
+        resizeStateRef.current = null;
+        document.removeEventListener("mousemove", handleMove);
+        document.removeEventListener("mouseup", handleUp);
+      };
+
+      document.addEventListener("mousemove", handleMove);
+      document.addEventListener("mouseup", handleUp);
+    },
+    [normalizedColumnWidths, onColumnWidthChange],
+  );
+
+  useEffect(() => {
+    return () => {
+      document.removeEventListener("mousemove", () => undefined);
+      document.removeEventListener("mouseup", () => undefined);
+    };
+  }, []);
 
   return (
     <div
       className="grid-table"
       role="grid"
       aria-label="Reactive AI Spreadsheet grid"
-      aria-rowcount={rows.length}
-      aria-colcount={columnHeaders.length}
+      aria-rowcount={displayedRows.length}
+      aria-colcount={columnDefinition.length}
       style={gridStyle}
     >
-      <div className="grid-header" role="row">
-        {columnHeaders.map((label, index) => (
-          <div
-            key={label}
-            className="grid-header-cell"
-            role="columnheader"
-            aria-colindex={index + 1}
-          >
-            {label}
-          </div>
-        ))}
+      <div className="grid-header" role="rowgroup">
+        <div className="grid-header-row" role="row">
+          {columnDefinition.map(({ id, label, align }, index) => (
+            <div
+              key={id}
+              className={`grid-header-cell${align ? ` grid-header-cell--${align}` : ""}`}
+              role="columnheader"
+              aria-colindex={index + 1}
+            >
+              {id === "select" ? (
+                <input
+                  type="checkbox"
+                  aria-label="Select all visible rows"
+                  checked={isAllVisibleSelected}
+                  onChange={(event) =>
+                    onToggleSelectAll(
+                      displayedRows.map((row) => row.rowId),
+                      event.currentTarget.checked,
+                    )
+                  }
+                />
+              ) : (
+                label
+              )}
+              <span
+                role="separator"
+                aria-hidden="true"
+                className="grid-resize-handle"
+                onMouseDown={(event) => handleResizeStart(id, event)}
+              />
+            </div>
+          ))}
+        </div>
       </div>
       <div
         className="grid-body"
@@ -412,6 +571,7 @@ export function CoreGrid({ rows, setRows }: CoreGridProps) {
           {visibleRows.map((row, visibleIndex) => {
             const rowIndex = startIndex + visibleIndex;
             const isActive = rowIndex === activeRow;
+            const actualRowIndex = displayedRowIndices[rowIndex];
             const toneClass = rowIndex % 2 === 0 ? "grid-row--even" : "grid-row--odd";
 
             return (
@@ -424,66 +584,55 @@ export function CoreGrid({ rows, setRows }: CoreGridProps) {
                 aria-rowindex={rowIndex + 1}
                 style={{ transform: `translateY(${rowIndex * ROW_HEIGHT}px)` }}
               >
-                <div
-                  className="grid-cell read-only-dimmed"
-                  role="gridcell"
-                  aria-colindex={1}
-                >
+                <div className="grid-cell grid-cell--selection" role="gridcell" aria-colindex={1}>
+                  <input
+                    type="checkbox"
+                    aria-label={`Select row ${rowIndex + 1}`}
+                    checked={selectedRowIds.has(row.rowId)}
+                    onChange={(event) =>
+                      onToggleRowSelection(row.rowId, event.currentTarget.checked)
+                    }
+                  />
+                </div>
+                <div className="grid-cell read-only-dimmed" role="gridcell" aria-colindex={2}>
                   {row.status}
                 </div>
-                <div
-                  className="grid-cell grid-cell--input"
-                  role="gridcell"
-                  aria-colindex={2}
-                >
+                <div className="grid-cell grid-cell--input" role="gridcell" aria-colindex={3}>
                   <textarea
                     ref={(element) => {
                       if (element) {
-                        inputRefs.current.set(rowIndex, element);
+                        inputRefs.current.set(row.rowId, element);
                       } else {
-                        inputRefs.current.delete(rowIndex);
+                        inputRefs.current.delete(row.rowId);
                       }
                     }}
                     value={row.input}
                     onChange={(event) =>
-                      handleInputChange(rowIndex, event.currentTarget.value)
+                      handleInputChange(actualRowIndex, event.currentTarget.value)
                     }
                     onPaste={(event) => handlePaste(event, rowIndex)}
-                    onFocus={() => handleFocus(rowIndex)}
+                    onFocus={() => {
+                      const filteredIndex = displayedRowIndices.indexOf(actualRowIndex);
+                      handleFocus(filteredIndex >= 0 ? filteredIndex : rowIndex);
+                    }}
                     onKeyDown={(event) => handleKeyDown(event, rowIndex)}
                     spellCheck={false}
                     aria-label={`Input for row ${rowIndex + 1}`}
                   />
                 </div>
-                <div className="grid-cell" role="gridcell" aria-colindex={3}>
+                <div className="grid-cell" role="gridcell" aria-colindex={4}>
                   {row.output}
                 </div>
-                <div
-                  className="grid-cell read-only-dimmed"
-                  role="gridcell"
-                  aria-colindex={4}
-                >
+                <div className="grid-cell read-only-dimmed" role="gridcell" aria-colindex={5}>
                   {row.len ?? ""}
                 </div>
-                <div
-                  className="grid-cell read-only-dimmed"
-                  role="gridcell"
-                  aria-colindex={5}
-                >
+                <div className="grid-cell read-only-dimmed" role="gridcell" aria-colindex={6}>
                   {row.lastUpdated}
                 </div>
-                <div
-                  className="grid-cell read-only-dimmed"
-                  role="gridcell"
-                  aria-colindex={6}
-                >
+                <div className="grid-cell read-only-dimmed" role="gridcell" aria-colindex={7}>
                   {row.errorStatus}
                 </div>
-                <div
-                  className="grid-cell grid-cell--numeric"
-                  role="gridcell"
-                  aria-colindex={7}
-                >
+                <div className="grid-cell grid-cell--numeric" role="gridcell" aria-colindex={8}>
                   {row.costPerOutput ? `$${row.costPerOutput.toFixed(4)}` : "—"}
                 </div>
               </div>
