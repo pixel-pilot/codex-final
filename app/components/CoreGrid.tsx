@@ -145,6 +145,30 @@ export const createRow = (): GridRow => ensureRowInitialized();
 export const createInitialRows = (count: number): GridRow[] =>
   Array.from({ length: count }, () => createRow());
 
+const STATUS_OPTIONS = [
+  { value: "Pending", label: "Pending", tone: "pending" },
+  { value: "In Progress", label: "Generate", tone: "generate" },
+  { value: "Complete", label: "Generated", tone: "generated" },
+] as const;
+
+type StatusOption = (typeof STATUS_OPTIONS)[number];
+type StatusValue = StatusOption["value"];
+type StatusTone = StatusOption["tone"];
+
+const STATUS_PRESENTATION: Record<StatusValue, { label: string; tone: StatusTone }> =
+  STATUS_OPTIONS.reduce((accumulator, option) => {
+    accumulator[option.value] = { label: option.label, tone: option.tone };
+    return accumulator;
+  }, {} as Record<StatusValue, { label: string; tone: StatusTone }>);
+
+const getStatusMeta = (status: string) => {
+  if (status in STATUS_PRESENTATION) {
+    return STATUS_PRESENTATION[status as StatusValue];
+  }
+
+  return null;
+};
+
 const parseClipboardText = (text: string): string[] => {
   const normalized = text.replace(/\r/g, "");
   const lines = normalized.split("\n");
@@ -334,6 +358,34 @@ export function CoreGrid({
         ) {
           return previous;
         }
+
+        next[rowIndex] = updated;
+        return next;
+      });
+    },
+    [setRows],
+  );
+
+  const handleStatusChange = useCallback(
+    (rowIndex: number, status: string) => {
+      setRows((previous) => {
+        const next = [...previous];
+
+        for (let i = next.length; i <= rowIndex; i += 1) {
+          next[i] = next[i] ?? createRow();
+        }
+
+        const normalized = ensureRowInitialized(next[rowIndex]);
+
+        if (normalized.status === status) {
+          return previous;
+        }
+
+        const updated: GridRow = withDerivedMetrics({
+          ...normalized,
+          status,
+          lastUpdated: createTimestamp(),
+        });
 
         next[rowIndex] = updated;
         return next;
@@ -573,6 +625,10 @@ export function CoreGrid({
             const isActive = rowIndex === activeRow;
             const actualRowIndex = displayedRowIndices[rowIndex];
             const toneClass = rowIndex % 2 === 0 ? "grid-row--even" : "grid-row--odd";
+            const statusMeta = getStatusMeta(row.status);
+            const statusToneClass = statusMeta
+              ? `status-select--${statusMeta.tone}`
+              : "status-select--unknown";
 
             return (
               <div
@@ -594,8 +650,30 @@ export function CoreGrid({
                     }
                   />
                 </div>
-                <div className="grid-cell read-only-dimmed" role="gridcell" aria-colindex={2}>
-                  {row.status}
+                <div className="grid-cell grid-cell--status" role="gridcell" aria-colindex={2}>
+                  <select
+                    value={row.status}
+                    className={`grid-status-select ${statusToneClass}`}
+                    onChange={(event) =>
+                      handleStatusChange(actualRowIndex, event.currentTarget.value)
+                    }
+                    onFocus={() => {
+                      const filteredIndex = displayedRowIndices.indexOf(actualRowIndex);
+                      handleFocus(filteredIndex >= 0 ? filteredIndex : rowIndex);
+                    }}
+                    aria-label={`Status for row ${rowIndex + 1}`}
+                  >
+                    {STATUS_OPTIONS.map((option) => (
+                      <option
+                        key={option.value}
+                        value={option.value}
+                        className={`status-option status-option--${option.tone}`}
+                      >
+                        {option.label}
+                      </option>
+                    ))}
+                    {!statusMeta ? <option value={row.status}>{row.status}</option> : null}
+                  </select>
                 </div>
                 <div className="grid-cell grid-cell--input" role="gridcell" aria-colindex={3}>
                   <textarea
