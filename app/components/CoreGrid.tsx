@@ -13,6 +13,7 @@ import type {
   KeyboardEvent,
   MouseEvent as ReactMouseEvent,
 } from "react";
+import { extractClipboardValues } from "../../lib/clipboard";
 
 export type GridRow = {
   rowId: string;
@@ -167,21 +168,6 @@ const getStatusMeta = (status: string) => {
   }
 
   return null;
-};
-
-const parseClipboardText = (text: string): string[] => {
-  const normalized = text.replace(/\r/g, "");
-  const lines = normalized.split("\n");
-
-  while (lines.length && lines[lines.length - 1] === "") {
-    lines.pop();
-  }
-
-  if (!lines.length) {
-    return [];
-  }
-
-  return lines.map((line) => line.split("\t")[0] ?? "");
 };
 
 type CoreGridProps = {
@@ -397,8 +383,7 @@ export function CoreGrid({
   const handlePaste = useCallback(
     (event: ClipboardEvent<HTMLTextAreaElement>, filteredRowIndex: number) => {
       event.preventDefault();
-      const clipboardText = event.clipboardData?.getData("text") ?? "";
-      const values = parseClipboardText(clipboardText);
+      const values = extractClipboardValues(event.clipboardData ?? null);
       if (!values.length) {
         return;
       }

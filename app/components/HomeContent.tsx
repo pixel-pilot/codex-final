@@ -9,14 +9,16 @@ import CoreGrid, {
   ColumnWidths,
   DEFAULT_COLUMN_WIDTHS,
 } from "./CoreGrid";
-import SettingsPanel, { SETTINGS_STORAGE_KEY } from "./SettingsPanel";
+import SettingsPanel from "./SettingsPanel";
+import UpdatesPanel from "./UpdatesPanel";
 
-type TabId = "generate" | "settings" | "usage";
+type TabId = "generate" | "settings" | "usage" | "updates";
 
 const TABS: { id: TabId; label: string }[] = [
   { id: "generate", label: "Generate" },
   { id: "settings", label: "Settings" },
   { id: "usage", label: "Usage & Costs" },
+  { id: "updates", label: "Updates" },
 ];
 
 type UsageEntry = {
@@ -52,6 +54,26 @@ const ERROR_LOG_STORAGE_KEY = "reactive-ai-spreadsheet-error-log";
 const RATE_LIMIT_EVENT = "reactive-ai:settings-rate-limit-changed";
 const DEFAULT_RATE_LIMIT = 120;
 const MAX_ERROR_LOG_ENTRIES = 80;
+const QA_REPORT_ENDPOINT = "/qa/latest.json";
+const QA_REFRESH_INTERVAL_MS = 5 * 60 * 1000;
+
+type QaCoverage = {
+  statements: number | null;
+  branches: number | null;
+  functions: number | null;
+  lines: number | null;
+};
+
+type QaReport = {
+  generatedAt: string;
+  coverage: QaCoverage | null;
+  note?: string;
+};
+
+type QaStatusState =
+  | { state: "loading"; report: QaReport | null; error: null }
+  | { state: "loaded"; report: QaReport | null; error: null }
+  | { state: "error"; report: null; error: string };
 
 const createTimestamp = () => new Date().toISOString();
 
@@ -162,7 +184,11 @@ export default function HomeContent() {
   const [errorLogHydrated, setErrorLogHydrated] = useState(false);
   const [dateRange, setDateRange] = useState("last30");
   const [customRange, setCustomRange] = useState({ start: "", end: "" });
-  const [rateLimitPerMinute, setRateLimitPerMinute] = useState(DEFAULT_RATE_LIMIT);
+  const [qaStatus, setQaStatus] = useState<QaStatusState>({
+    state: "loading",
+    report: null,
+    error: null,
+  });
 
   useEffect(() => {
     if (typeof window === "undefined") {
@@ -423,6 +449,48 @@ export default function HomeContent() {
     window.addEventListener("storage", handleStorage);
     return () => {
       window.removeEventListener("storage", handleStorage);
+    };
+  }, []);
+
+  useEffect(() => {
+    if (typeof window === "undefined") {
+      return;
+    }
+
+    let cancelled = false;
+
+    const loadQaReport = async () => {
+      try {
+        const response = await fetch(QA_REPORT_ENDPOINT, { cache: "no-store" });
+        if (!response.ok) {
+          throw new Error(`Request failed (${response.status})`);
+        }
+
+        const payload = (await response.json()) as QaReport;
+        if (!cancelled) {
+          setQaStatus({ state: "loaded", report: payload, error: null });
+        }
+      } catch (error) {
+        if (!cancelled) {
+          setQaStatus({
+            state: "error",
+            report: null,
+            error:
+              error instanceof Error
+                ? error.message
+                : "Unable to load QA report.",
+          });
+        }
+      }
+    };
+
+    setQaStatus({ state: "loading", report: null, error: null });
+    loadQaReport();
+    const interval = window.setInterval(loadQaReport, QA_REFRESH_INTERVAL_MS);
+
+    return () => {
+      cancelled = true;
+      window.clearInterval(interval);
     };
   }, []);
 
@@ -1091,6 +1159,12 @@ export default function HomeContent() {
 
   const renderUsageView = () => {
     const customRangeError = rangeSelection.rangeError;
+    const qaReport = qaStatus.report;
+    const coverageEntries: Array<[keyof QaCoverage, number]> = qaReport?.coverage
+      ? (Object.entries(qaReport.coverage) as Array<[keyof QaCoverage, number | null]>)
+          .filter(([, value]) => value !== null)
+          .map(([metric, value]) => [metric, value as number])
+      : [];
 
     return (
       <section className="usage-container" aria-label="Usage history and costs">
@@ -1212,6 +1286,37 @@ export default function HomeContent() {
             </table>
           </div>
         </div>
+        <section className="usage-qa-status" aria-label="Automated QA validation status">
+          <div className="usage-qa-status__header">
+            <h3>Automated QA status</h3>
+            {qaReport?.generatedAt && (
+              <time dateTime={qaReport.generatedAt}>
+                Updated {new Date(qaReport.generatedAt).toLocaleString()}
+              </time>
+            )}
+          </div>
+          {qaStatus.state === "loading" && <p>Loading latest QA results…</p>}
+          {qaStatus.state === "error" && (
+            <p role="alert">Unable to load QA report: {qaStatus.error}</p>
+          )}
+          {qaStatus.state === "loaded" && (
+            <>
+              {coverageEntries.length > 0 ? (
+                <dl className="usage-qa-status__metrics">
+                  {coverageEntries.map(([metric, value]) => (
+                    <div key={metric} className="usage-qa-status__metric">
+                      <dt>{metric.replace(/^[a-z]/, (char) => char.toUpperCase())}</dt>
+                      <dd>{`${value.toFixed(2)}%`}</dd>
+                    </div>
+                  ))}
+                </dl>
+              ) : (
+                <p>No coverage metrics were reported.</p>
+              )}
+              {qaReport?.note && <p className="usage-qa-status__note">{qaReport.note}</p>}
+            </>
+          )}
+        </section>
       </section>
     );
   };
@@ -1248,6 +1353,11 @@ export default function HomeContent() {
         </section>
       )}
       {activeTab === "usage" && renderUsageView()}
+      {activeTab === "updates" && (
+        <section className="updates-container" aria-label="Recent application updates">
+          <UpdatesPanel />
+        </section>
+      )}
     </main>
   );
 }
