@@ -466,12 +466,20 @@ const CoreGrid = forwardRef<CoreGridHandle>(function CoreGridComponent(_, ref) {
           status: shouldResetStatus ? "Pending" : normalized.status,
           len: nextLen,
           lastUpdated: nextTimestamp,
+          output: shouldResetStatus ? "" : normalized.output,
+          errorStatus: shouldResetStatus ? "" : normalized.errorStatus,
+          retries: shouldResetStatus ? 0 : normalized.retries,
         };
 
         if (
           shouldResetStatus ||
           normalized.len !== updated.len ||
-          normalized.lastUpdated !== updated.lastUpdated
+          normalized.lastUpdated !== updated.lastUpdated ||
+          normalized.output !== updated.output ||
+          normalized.errorStatus !== updated.errorStatus ||
+          normalized.retries !== updated.retries ||
+          normalized.status !== updated.status ||
+          normalized.input !== updated.input
         ) {
           mutated = true;
         }
@@ -504,6 +512,9 @@ const CoreGrid = forwardRef<CoreGridHandle>(function CoreGridComponent(_, ref) {
         status: shouldResetStatus ? "Pending" : normalized.status,
         len: nextLen,
         lastUpdated: nextTimestamp,
+        output: shouldResetStatus ? "" : normalized.output,
+        errorStatus: shouldResetStatus ? "" : normalized.errorStatus,
+        retries: shouldResetStatus ? 0 : normalized.retries,
       };
 
       const createdRow = rowIndex >= previous.length;
@@ -513,6 +524,10 @@ const CoreGrid = forwardRef<CoreGridHandle>(function CoreGridComponent(_, ref) {
         normalized.input === updated.input &&
         normalized.len === updated.len &&
         normalized.lastUpdated === updated.lastUpdated &&
+        normalized.output === updated.output &&
+        normalized.errorStatus === updated.errorStatus &&
+        normalized.retries === updated.retries &&
+        normalized.status === updated.status &&
         !createdRow
       ) {
         return previous;
