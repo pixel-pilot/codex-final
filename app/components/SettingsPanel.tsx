@@ -4,6 +4,7 @@ import {
   useCallback,
   useEffect,
   useMemo,
+  useRef,
   useState,
 } from "react";
 
@@ -97,6 +98,12 @@ export default function SettingsPanel() {
   const [topP, setTopP] = useState<number | "">(0.9);
   const [topK, setTopK] = useState<number | "">(40);
   const [reasoningLevel, setReasoningLevel] = useState<"off" | "standard" | "deep">("off");
+  const [isModelDropdownOpen, setIsModelDropdownOpen] = useState(false);
+  const dropdownRef = useRef<HTMLDivElement | null>(null);
+  const [isValidatingApiKey, setIsValidatingApiKey] = useState(false);
+  const [apiValidationStatus, setApiValidationStatus] = useState<
+    { tone: "info" | "success" | "error"; message: string } | null
+  >(null);
 
   useEffect(() => {
     const pruneNotifications = () => {
@@ -113,6 +120,36 @@ export default function SettingsPanel() {
       window.clearInterval(interval);
     };
   }, []);
+
+  useEffect(() => {
+    if (!isModelDropdownOpen) {
+      return undefined;
+    }
+
+    const handlePointerDown = (event: MouseEvent) => {
+      if (!dropdownRef.current) {
+        return;
+      }
+
+      if (!dropdownRef.current.contains(event.target as Node)) {
+        setIsModelDropdownOpen(false);
+      }
+    };
+
+    const handleEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        setIsModelDropdownOpen(false);
+      }
+    };
+
+    document.addEventListener("mousedown", handlePointerDown);
+    document.addEventListener("keydown", handleEscape);
+
+    return () => {
+      document.removeEventListener("mousedown", handlePointerDown);
+      document.removeEventListener("keydown", handleEscape);
+    };
+  }, [isModelDropdownOpen]);
 
   const apiKeyStatus = useMemo(() => {
     if (!apiKey.trim()) {
@@ -246,6 +283,41 @@ export default function SettingsPanel() {
     }
   }, [apiKey, knownModelIds]);
 
+  const handleValidateApiKey = useCallback(async () => {
+    const trimmedKey = apiKey.trim();
+    if (!trimmedKey) {
+      setApiValidationStatus({
+        tone: "error",
+        message: "Enter your OpenRouter API key before validating.",
+      });
+      return;
+    }
+
+    setIsValidatingApiKey(true);
+    setApiValidationStatus({ tone: "info", message: "Validating API key…" });
+
+    try {
+      const response = await fetch("https://openrouter.ai/api/v1/auth/key", {
+        headers: {
+          Accept: "application/json",
+          Authorization: `Bearer ${trimmedKey}`,
+        },
+      });
+
+      if (!response.ok) {
+        throw new Error(`Validation failed (${response.status})`);
+      }
+
+      setApiValidationStatus({ tone: "success", message: "API key verified successfully." });
+    } catch (error) {
+      const message =
+        error instanceof Error ? error.message : "Unable to validate the API key at this time.";
+      setApiValidationStatus({ tone: "error", message });
+    } finally {
+      setIsValidatingApiKey(false);
+    }
+  }, [apiKey]);
+
   const filteredModels = useMemo(() => {
     if (!searchTerm.trim()) {
       return models;
@@ -273,6 +345,15 @@ export default function SettingsPanel() {
     return filteredModels.some((model) => model.id === selectedModelId) ? selectedModelId : "";
   }, [filteredModels, selectedModelId]);
 
+  const toggleModelDropdown = useCallback(() => {
+    setIsModelDropdownOpen((previous) => !previous);
+  }, []);
+
+  const handleModelSelect = useCallback((modelId: string) => {
+    setSelectedModelId(modelId);
+    setIsModelDropdownOpen(false);
+  }, []);
+
   const handleNumericChange = useCallback((value: string, setter: (next: number | "") => void) => {
     if (!value.trim()) {
       setter("");
@@ -295,8 +376,16 @@ export default function SettingsPanel() {
       </p>
 
       <section className="settings-card" aria-labelledby="openrouter-api-heading">
-        <div className="settings-card__header">
+        <div className="settings-card__header settings-card__header--compact">
           <h2 id="openrouter-api-heading">OpenRouter API Connection</h2>
+          <button
+            type="button"
+            className="settings-action-button"
+            onClick={handleValidateApiKey}
+            disabled={!apiKey.trim() || isValidatingApiKey}
+          >
+            {isValidatingApiKey ? "Validating…" : "Validate key"}
+          </button>
         </div>
         <div className="settings-field">
           <label htmlFor="openrouter-api-key">API Key</label>
@@ -317,16 +406,23 @@ export default function SettingsPanel() {
           >
             {apiKeyStatus.message}
           </p>
+          {apiValidationStatus && (
+            <p
+              className={`settings-field__message settings-field__message--${apiValidationStatus.tone}`}
+              role={apiValidationStatus.tone === "error" ? "alert" : "status"}
+            >
+              {apiValidationStatus.message}
+            </p>
+          )}
         </div>
       </section>
 
-      <section className="settings-card" aria-labelledby="text-models-heading">
-        <div className="settings-card__header">
+      <section className="settings-card settings-card--model" aria-labelledby="text-models-heading">
+        <div className="settings-card__header settings-card__header--compact">
           <div>
-            <h2 id="text-models-heading">Text Models</h2>
+            <h2 id="text-models-heading">Model configuration</h2>
             <p className="settings-card__description">
-              Fetch the current OpenRouter catalog, then filter and select a model to pair with the grid. Pricing is
-              listed per 1K tokens.
+              Browse the OpenRouter catalog, compare pricing, and adjust inference parameters side by side.
             </p>
           </div>
           <button
@@ -335,51 +431,157 @@ export default function SettingsPanel() {
             onClick={handleFetchModels}
             disabled={isFetchingModels}
           >
-            {isFetchingModels ? "Fetching…" : "Fetch"}
+            {isFetchingModels ? "Fetching…" : "Refresh catalog"}
           </button>
         </div>
-
-        <div className="settings-field">
-          <label htmlFor="model-search">Search Models</label>
-          <input
-            id="model-search"
-            type="search"
-            placeholder="Search by name, slug, or description"
-            value={searchTerm}
-            onChange={(event) => setSearchTerm(event.currentTarget.value)}
-          />
-        </div>
-
-        <div className="settings-field">
-          <label htmlFor="model-select">Available Models</label>
-          <div className="model-select-wrapper">
-            <select
-              id="model-select"
-              value={resolvedSelectedModelId}
-              onChange={(event) => setSelectedModelId(event.currentTarget.value)}
-              size={Math.min(10, Math.max(4, filteredModels.length))}
+        <div className="model-config">
+          <div className="model-dropdown" ref={dropdownRef}>
+            <button
+              type="button"
+              className="model-dropdown__trigger"
+              onClick={toggleModelDropdown}
+              aria-expanded={isModelDropdownOpen}
+              aria-haspopup="listbox"
             >
-              {filteredModels.map((model) => (
-                <option key={model.id} value={model.id}>
-                  {`${model.name ?? model.id} — ${formatPricingLabel(model)}`}
-                </option>
-              ))}
-              {!filteredModels.length && <option disabled value="">No models match the current filters.</option>}
-            </select>
+              <span className="model-dropdown__label">
+                {resolvedSelectedModelId
+                  ? models.find((model) => model.id === resolvedSelectedModelId)?.name ?? resolvedSelectedModelId
+                  : "Select a model"}
+              </span>
+              <span className="model-dropdown__count">{filteredModels.length} available</span>
+            </button>
+            {isModelDropdownOpen && (
+              <div className="model-dropdown__panel" role="listbox" aria-label="OpenRouter models">
+                <div className="model-dropdown__search">
+                  <input
+                    type="search"
+                    placeholder="Search by name, slug, or description"
+                    value={searchTerm}
+                    onChange={(event) => setSearchTerm(event.currentTarget.value)}
+                  />
+                </div>
+                <ul>
+                  {filteredModels.length > 0 ? (
+                    filteredModels.map((model) => (
+                      <li key={model.id}>
+                        <button
+                          type="button"
+                          role="option"
+                          aria-selected={resolvedSelectedModelId === model.id}
+                          onClick={() => handleModelSelect(model.id)}
+                        >
+                          <span className="model-dropdown__option-name">{model.name ?? model.id}</span>
+                          <span className="model-dropdown__option-pricing">{formatPricingLabel(model)}</span>
+                          {model.description && (
+                            <span className="model-dropdown__option-description">{model.description}</span>
+                          )}
+                        </button>
+                      </li>
+                    ))
+                  ) : (
+                    <li className="model-dropdown__empty">No models match the current filters.</li>
+                  )}
+                </ul>
+                <div className="model-dropdown__footer">
+                  {fetchError ? (
+                    <span className="model-dropdown__error" role="alert">
+                      {fetchError}
+                    </span>
+                  ) : lastFetchedAt ? (
+                    `Last refreshed ${formatTimestamp(lastFetchedAt)}.`
+                  ) : (
+                    "Catalog not fetched yet."
+                  )}
+                </div>
+              </div>
+            )}
           </div>
-          <div className="settings-field__hint" role="note">
-            {lastFetchedAt ? `Last fetched ${formatTimestamp(lastFetchedAt)}.` : "Models have not been fetched yet."}
+          <div className="model-parameters">
+            <div className="settings-parameter-grid">
+              <div className="settings-field">
+                <label htmlFor="max-tokens">Max Tokens</label>
+                <input
+                  id="max-tokens"
+                  type="number"
+                  min={1}
+                  step={1}
+                  value={maxTokens}
+                  onChange={(event) => handleNumericChange(event.currentTarget.value, setMaxTokens)}
+                />
+              </div>
+              <div className="settings-field">
+                <label htmlFor="temperature">Temperature</label>
+                <input
+                  id="temperature"
+                  type="number"
+                  min={0}
+                  max={2}
+                  step={0.01}
+                  value={temperature}
+                  onChange={(event) => handleNumericChange(event.currentTarget.value, setTemperature)}
+                />
+              </div>
+              <div className="settings-field">
+                <label htmlFor="repetition-penalty">Repetition Penalty</label>
+                <input
+                  id="repetition-penalty"
+                  type="number"
+                  min={0}
+                  step={0.01}
+                  value={repetitionPenalty}
+                  onChange={(event) => handleNumericChange(event.currentTarget.value, setRepetitionPenalty)}
+                />
+              </div>
+              <div className="settings-field">
+                <label htmlFor="top-p">Top-P</label>
+                <input
+                  id="top-p"
+                  type="number"
+                  min={0}
+                  max={1}
+                  step={0.01}
+                  value={topP}
+                  onChange={(event) => handleNumericChange(event.currentTarget.value, setTopP)}
+                />
+              </div>
+              <div className="settings-field">
+                <label htmlFor="top-k">Top-K</label>
+                <input
+                  id="top-k"
+                  type="number"
+                  min={0}
+                  step={1}
+                  value={topK}
+                  onChange={(event) => handleNumericChange(event.currentTarget.value, setTopK)}
+                />
+              </div>
+              <div className="settings-field">
+                <label htmlFor="reasoning-level">Reasoning Effort Level</label>
+                <select
+                  id="reasoning-level"
+                  value={reasoningLevel}
+                  onChange={(event) => setReasoningLevel(event.currentTarget.value as typeof reasoningLevel)}
+                >
+                  <option value="off">Base (no additional reasoning)</option>
+                  <option value="standard">Standard (:thinking / reasoning_effort: 1)</option>
+                  <option value="deep">Deep (:deep-reasoning / reasoning_effort: 2)</option>
+                </select>
+                <p className="settings-field__hint">
+                  Choose how aggressively the selected model should allocate reasoning tokens. Higher levels improve
+                  reliability at additional cost and latency.
+                </p>
+              </div>
+            </div>
           </div>
-          {fetchError && (
-            <p className="settings-field__message settings-field__message--error" role="alert">
-              {fetchError}
-            </p>
-          )}
         </div>
-
+        {!isModelDropdownOpen && fetchError && (
+          <p className="settings-field__message settings-field__message--error" role="alert">
+            {fetchError}
+          </p>
+        )}
         {activeNotifications.length > 0 && (
           <div className="settings-notifications" role="status" aria-live="polite">
-            <h3>Recently Added Models</h3>
+            <h3>Recently added models</h3>
             <ul>
               {activeNotifications.map((notification) => (
                 <li key={`${notification.id}-${notification.timestamp}`}>
@@ -392,7 +594,6 @@ export default function SettingsPanel() {
             </ul>
           </div>
         )}
-
         <div className="settings-toggle">
           <span>Web Search</span>
           <label className="toggle-switch">
@@ -408,87 +609,6 @@ export default function SettingsPanel() {
             When enabled, requests will append <code>:online</code> to supported models so they use OpenRouter web
             search augmentation.
           </p>
-        </div>
-      </section>
-
-      <section className="settings-card" aria-labelledby="model-parameters-heading">
-        <div className="settings-card__header">
-          <h2 id="model-parameters-heading">Model Parameters</h2>
-        </div>
-        <div className="settings-parameter-grid">
-          <div className="settings-field">
-            <label htmlFor="max-tokens">Max Tokens</label>
-            <input
-              id="max-tokens"
-              type="number"
-              min={1}
-              step={1}
-              value={maxTokens}
-              onChange={(event) => handleNumericChange(event.currentTarget.value, setMaxTokens)}
-            />
-          </div>
-          <div className="settings-field">
-            <label htmlFor="temperature">Temperature</label>
-            <input
-              id="temperature"
-              type="number"
-              min={0}
-              max={2}
-              step={0.01}
-              value={temperature}
-              onChange={(event) => handleNumericChange(event.currentTarget.value, setTemperature)}
-            />
-          </div>
-          <div className="settings-field">
-            <label htmlFor="repetition-penalty">Repetition Penalty</label>
-            <input
-              id="repetition-penalty"
-              type="number"
-              min={0}
-              step={0.01}
-              value={repetitionPenalty}
-              onChange={(event) => handleNumericChange(event.currentTarget.value, setRepetitionPenalty)}
-            />
-          </div>
-          <div className="settings-field">
-            <label htmlFor="top-p">Top-P</label>
-            <input
-              id="top-p"
-              type="number"
-              min={0}
-              max={1}
-              step={0.01}
-              value={topP}
-              onChange={(event) => handleNumericChange(event.currentTarget.value, setTopP)}
-            />
-          </div>
-          <div className="settings-field">
-            <label htmlFor="top-k">Top-K</label>
-            <input
-              id="top-k"
-              type="number"
-              min={0}
-              step={1}
-              value={topK}
-              onChange={(event) => handleNumericChange(event.currentTarget.value, setTopK)}
-            />
-          </div>
-          <div className="settings-field">
-            <label htmlFor="reasoning-level">Reasoning Effort Level</label>
-            <select
-              id="reasoning-level"
-              value={reasoningLevel}
-              onChange={(event) => setReasoningLevel(event.currentTarget.value as typeof reasoningLevel)}
-            >
-              <option value="off">Base (no additional reasoning)</option>
-              <option value="standard">Standard (:thinking / reasoning_effort: 1)</option>
-              <option value="deep">Deep (:deep-reasoning / reasoning_effort: 2)</option>
-            </select>
-            <p className="settings-field__hint">
-              Choose how aggressively the selected model should allocate reasoning tokens. Higher levels improve
-              reliability at additional cost and latency.
-            </p>
-          </div>
         </div>
       </section>
     </div>
