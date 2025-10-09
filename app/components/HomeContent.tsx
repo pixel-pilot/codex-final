@@ -558,7 +558,7 @@ export default function HomeContent() {
     setSystemActive((previous) => !previous);
   };
 
-  const { pending, inProgress, complete, totalCost } = useMemo(() => {
+  const { pending, inProgress, complete, totalCost, percentages, completionRatios } = useMemo(() => {
     let pendingCount = 0;
     let inProgressCount = 0;
     let completeCount = 0;
@@ -580,13 +580,55 @@ export default function HomeContent() {
       }
     });
 
+    const aggregateCount = pendingCount + inProgressCount + completeCount;
+    const safeTotal = aggregateCount === 0 ? 1 : aggregateCount;
+    const toPercent = (value: number) =>
+      aggregateCount === 0 ? 0 : Math.round((value / aggregateCount) * 100);
+
     return {
       pending: pendingCount,
       inProgress: inProgressCount,
       complete: completeCount,
       totalCost: runningCost,
+      totalCount: aggregateCount,
+      percentages: {
+        pending: toPercent(pendingCount),
+        inProgress: toPercent(inProgressCount),
+        complete: toPercent(completeCount),
+      },
+      completionRatios: {
+        pending: Math.min(1, Math.max(0, 1 - pendingCount / safeTotal)),
+        inProgress: Math.min(1, Math.max(0, 1 - inProgressCount / safeTotal)),
+        complete: Math.min(1, Math.max(0, aggregateCount === 0 ? 1 : completeCount / safeTotal)),
+      },
     };
   }, [rows]);
+
+  const { pending: pendingPercent, inProgress: inProgressPercent, complete: completePercent } = percentages;
+  const {
+    pending: pendingRatio,
+    inProgress: inProgressRatio,
+    complete: completeRatio,
+  } = completionRatios;
+
+  const metricColors = useMemo(() => {
+    const toColor = (ratio: number) => {
+      const clamped = Number.isFinite(ratio) ? Math.min(1, Math.max(0, ratio)) : 0;
+      const hueStart = 0;
+      const hueEnd = 142;
+      const hue = hueStart + (hueEnd - hueStart) * clamped;
+      const saturation = 70;
+      const lightness = 42 + 10 * clamped;
+
+      return `hsl(${Math.round(hue)}, ${saturation}%, ${Math.round(lightness)}%)`;
+    };
+
+    return {
+      pending: toColor(pendingRatio),
+      inProgress: toColor(inProgressRatio),
+      complete: toColor(completeRatio),
+    };
+  }, [pendingRatio, inProgressRatio, completeRatio]);
 
   const rangeSelection = useMemo(() => {
     const now = Date.now();
@@ -800,15 +842,36 @@ export default function HomeContent() {
         <div className="generate-metrics" role="list">
           <div className="generate-metric" role="listitem">
             <span className="generate-metric__label">Pending rows</span>
-            <span className="generate-metric__value">{pending.toLocaleString()}</span>
+            <span
+              className="generate-metric__value"
+              style={{ color: metricColors.pending }}
+              aria-label={`${pending.toLocaleString()} pending rows representing ${pendingPercent}% of all rows`}
+            >
+              {pending.toLocaleString()}
+              <span className="generate-metric__percentage">• {pendingPercent}%</span>
+            </span>
           </div>
           <div className="generate-metric" role="listitem">
             <span className="generate-metric__label">In progress</span>
-            <span className="generate-metric__value">{inProgress.toLocaleString()}</span>
+            <span
+              className="generate-metric__value"
+              style={{ color: metricColors.inProgress }}
+              aria-label={`${inProgress.toLocaleString()} rows in progress representing ${inProgressPercent}% of all rows`}
+            >
+              {inProgress.toLocaleString()}
+              <span className="generate-metric__percentage">• {inProgressPercent}%</span>
+            </span>
           </div>
           <div className="generate-metric" role="listitem">
             <span className="generate-metric__label">Completed</span>
-            <span className="generate-metric__value">{complete.toLocaleString()}</span>
+            <span
+              className="generate-metric__value"
+              style={{ color: metricColors.complete }}
+              aria-label={`${complete.toLocaleString()} completed rows representing ${completePercent}% of all rows`}
+            >
+              {complete.toLocaleString()}
+              <span className="generate-metric__percentage">• {completePercent}%</span>
+            </span>
           </div>
           <div className="generate-metric" role="listitem">
             <span className="generate-metric__label">
