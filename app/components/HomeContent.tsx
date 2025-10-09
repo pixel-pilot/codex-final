@@ -9,7 +9,7 @@ import CoreGrid, {
   ColumnWidths,
   DEFAULT_COLUMN_WIDTHS,
 } from "./CoreGrid";
-import SettingsPanel from "./SettingsPanel";
+import SettingsPanel, { SETTINGS_STORAGE_KEY } from "./SettingsPanel";
 
 type TabId = "generate" | "settings" | "usage";
 
@@ -49,6 +49,8 @@ type GridFilters = {
 const ROW_STORAGE_KEY = "reactive-ai-spreadsheet-rows";
 const COLUMN_WIDTH_STORAGE_KEY = "reactive-ai-spreadsheet-column-widths";
 const ERROR_LOG_STORAGE_KEY = "reactive-ai-spreadsheet-error-log";
+const RATE_LIMIT_EVENT = "reactive-ai:settings-rate-limit-changed";
+const DEFAULT_RATE_LIMIT = 120;
 const MAX_ERROR_LOG_ENTRIES = 80;
 
 const createTimestamp = () => new Date().toISOString();
@@ -160,6 +162,7 @@ export default function HomeContent() {
   const [errorLogHydrated, setErrorLogHydrated] = useState(false);
   const [dateRange, setDateRange] = useState("last30");
   const [customRange, setCustomRange] = useState({ start: "", end: "" });
+  const [rateLimitPerMinute, setRateLimitPerMinute] = useState(DEFAULT_RATE_LIMIT);
 
   useEffect(() => {
     if (typeof window === "undefined") {
@@ -183,6 +186,68 @@ export default function HomeContent() {
     } finally {
       setRowsHydrated(true);
     }
+  }, []);
+
+  useEffect(() => {
+    if (typeof window === "undefined") {
+      return;
+    }
+
+    const clampRateLimit = (value: number | null | undefined): number => {
+      if (typeof value !== "number" || Number.isNaN(value) || !Number.isFinite(value)) {
+        return DEFAULT_RATE_LIMIT;
+      }
+      return Math.min(Math.max(Math.round(value), 1), 250);
+    };
+
+    const syncFromStorage = () => {
+      try {
+        const raw = window.localStorage.getItem(SETTINGS_STORAGE_KEY);
+        if (!raw) {
+          setRateLimitPerMinute(DEFAULT_RATE_LIMIT);
+          return;
+        }
+
+        const parsed = JSON.parse(raw) as { rateLimitPerMinute?: unknown } | null;
+        const next = clampRateLimit(
+          parsed && typeof parsed === "object"
+            ? (parsed.rateLimitPerMinute as number | null | undefined)
+            : null,
+        );
+        setRateLimitPerMinute(next);
+      } catch (error) {
+        console.error("Unable to sync rate limit preference", error);
+      }
+    };
+
+    const handleCustomRateLimit = (event: Event) => {
+      if (!("detail" in event)) {
+        return;
+      }
+      const detail = (event as CustomEvent<{ value: number | null }>).detail;
+      if (!detail) {
+        setRateLimitPerMinute(DEFAULT_RATE_LIMIT);
+        return;
+      }
+
+      setRateLimitPerMinute(clampRateLimit(detail.value));
+    };
+
+    const handleStorage = (event: StorageEvent) => {
+      if (event.key && event.key !== SETTINGS_STORAGE_KEY) {
+        return;
+      }
+      syncFromStorage();
+    };
+
+    syncFromStorage();
+    window.addEventListener(RATE_LIMIT_EVENT, handleCustomRateLimit as EventListener);
+    window.addEventListener("storage", handleStorage);
+
+    return () => {
+      window.removeEventListener(RATE_LIMIT_EVENT, handleCustomRateLimit as EventListener);
+      window.removeEventListener("storage", handleStorage);
+    };
   }, []);
 
   useEffect(() => {
@@ -722,7 +787,10 @@ export default function HomeContent() {
       return undefined;
     }
 
-    const interval = window.setInterval(() => {
+    const limit = Math.min(Math.max(rateLimitPerMinute, 1), 250);
+    const intervalMs = Math.max(Math.floor(60000 / limit), 200);
+
+    const runGenerationCycle = () => {
       let failureEntry: ErrorLogEntry | null = null;
 
       setRows((previous) => {
@@ -807,10 +875,12 @@ export default function HomeContent() {
           return nextLog.slice(0, MAX_ERROR_LOG_ENTRIES);
         });
       }
-    }, 2500);
+    };
 
+    runGenerationCycle();
+    const interval = window.setInterval(runGenerationCycle, intervalMs);
     return () => window.clearInterval(interval);
-  }, [setRows, systemActive, setErrorLog]);
+  }, [rateLimitPerMinute, setErrorLog, setRows, systemActive]);
 
   const renderGenerateView = () => {
     const costLabel = systemActive ? "Running cost" : "Completed cost";
@@ -930,33 +1000,45 @@ export default function HomeContent() {
               type="button"
               className="grid-action-button"
               onClick={handleClearSelectedInputs}
+              title="Remove input text from all selected rows."
+              aria-label="Clear all inputs. Removes input text from all selected rows."
               disabled={!selectedCount}
             >
-              Clear input
+              Clear All Inputs
+              <span className="grid-action-button__hint" aria-hidden="true">?</span>
             </button>
             <button
               type="button"
               className="grid-action-button"
               onClick={handleClearSelectedOutputs}
+              title="Remove generated output from all selected rows."
+              aria-label="Clear all outputs. Removes generated output from all selected rows."
               disabled={!selectedCount}
             >
-              Clear output
+              Clear All Outputs
+              <span className="grid-action-button__hint" aria-hidden="true">?</span>
             </button>
             <button
               type="button"
               className="grid-action-button grid-action-button--danger"
               onClick={handleDeleteSelectedRows}
+              title="Delete every selected row from the grid."
+              aria-label="Delete selected rows. Removes every selected row from the grid."
               disabled={!selectedCount}
             >
-              Delete rows
+              Delete Selected Rows
+              <span className="grid-action-button__hint" aria-hidden="true">?</span>
             </button>
             <button
               type="button"
               className="grid-action-button"
               onClick={handleClearSelection}
+              title="Deselect all currently highlighted rows."
+              aria-label="Deselect all rows. Clears the current selection."
               disabled={!selectedCount}
             >
-              Reset selection
+              Deselect All
+              <span className="grid-action-button__hint" aria-hidden="true">?</span>
             </button>
           </div>
         </div>
