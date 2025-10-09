@@ -1,7 +1,6 @@
 import React from "react";
 import { render, screen, within, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import SettingsPanel from "../SettingsPanel";
 import type {
   PersistedModelCatalog,
   PersistedSettingsState,
@@ -62,11 +61,37 @@ function createSettingsRepositoryMock() {
       settingsListeners.clear();
       catalogListeners.clear();
       loadSettingsState.mockReset();
+      loadSettingsState.mockImplementation(async () => settingsState);
       saveSettingsState.mockReset();
+      saveSettingsState.mockImplementation(async (payload: PersistedSettingsState) => {
+        settingsState = payload;
+        settingsListeners.forEach((listener) => listener(payload));
+      });
       subscribeToSettingsState.mockReset();
+      subscribeToSettingsState.mockImplementation(
+        (handler: (payload: PersistedSettingsState | null) => void) => {
+          settingsListeners.add(handler);
+          return () => {
+            settingsListeners.delete(handler);
+          };
+        },
+      );
       loadModelCatalog.mockReset();
+      loadModelCatalog.mockImplementation(async () => catalogState);
       saveModelCatalog.mockReset();
+      saveModelCatalog.mockImplementation(async (payload: PersistedModelCatalog) => {
+        catalogState = payload;
+        catalogListeners.forEach((listener) => listener(payload));
+      });
       subscribeToModelCatalog.mockReset();
+      subscribeToModelCatalog.mockImplementation(
+        (handler: (payload: PersistedModelCatalog | null) => void) => {
+          catalogListeners.add(handler);
+          return () => {
+            catalogListeners.delete(handler);
+          };
+        },
+      );
     },
   } satisfies Partial<SettingsRepositoryModule> & {
     __setSettings: (payload: PersistedSettingsState | null) => void;
@@ -77,17 +102,36 @@ function createSettingsRepositoryMock() {
   };
 }
 
-const settingsRepositoryMock: ReturnType<typeof createSettingsRepositoryMock> =
-  vi.hoisted(
-    () => createSettingsRepositoryMock() as ReturnType<typeof createSettingsRepositoryMock>,
-  );
+const settingsRepositoryMock: ReturnType<typeof createSettingsRepositoryMock> = vi.hoisted(
+  () => createSettingsRepositoryMock() as ReturnType<typeof createSettingsRepositoryMock>,
+);
 
-vi.mock("../../../lib/settingsRepository", () => settingsRepositoryMock);
+const SETTINGS_REPOSITORY_PATH = "../../../lib/settingsRepository";
+const SUPABASE_CLIENT_PATH = "../../../lib/supabaseClient";
+
+const importSettingsPanel = async () => (await import("../SettingsPanel")).default;
+
+const mockSettingsRepositoryModule = () => {
+  vi.doMock(SETTINGS_REPOSITORY_PATH, () => ({
+    __esModule: true,
+    ...settingsRepositoryMock,
+  }));
+};
+
+const unmockSettingsRepositoryModule = () => {
+  vi.doUnmock(SETTINGS_REPOSITORY_PATH);
+};
 
 describe("SettingsPanel", () => {
-  beforeEach(() => {
-    settingsRepositoryMock.__reset();
+  beforeEach(async () => {
+    vi.resetModules();
     vi.restoreAllMocks();
+    settingsRepositoryMock.__reset();
+    mockSettingsRepositoryModule();
+  });
+
+  afterEach(() => {
+    unmockSettingsRepositoryModule();
   });
 
   it("hydrates persisted preferences, prunes stale notifications, and persists updates", async () => {
@@ -123,6 +167,8 @@ describe("SettingsPanel", () => {
     settingsRepositoryMock.__setSettings(settingsPayload);
     settingsRepositoryMock.__setCatalog(catalogPayload);
 
+    const SettingsPanel = await importSettingsPanel();
+
     render(<SettingsPanel />);
 
     const apiKeyInput = await screen.findByLabelText("API Key");
@@ -151,11 +197,9 @@ describe("SettingsPanel", () => {
       expect(settingsRepositoryMock.saveSettingsState).toHaveBeenCalled();
     });
 
-    const lastCallIndex =
-      settingsRepositoryMock.saveSettingsState.mock.calls.length - 1;
+    const lastCallIndex = settingsRepositoryMock.saveSettingsState.mock.calls.length - 1;
     expect(lastCallIndex).toBeGreaterThanOrEqual(0);
-    const persisted =
-      settingsRepositoryMock.saveSettingsState.mock.calls[lastCallIndex][0];
+    const persisted = settingsRepositoryMock.saveSettingsState.mock.calls[lastCallIndex][0];
     expect(persisted.webSearchEnabled).toBe(false);
     expect(persisted.modelNotifications).toEqual(
       expect.arrayContaining([expect.objectContaining({ id: "fresh" })]),
@@ -184,6 +228,8 @@ describe("SettingsPanel", () => {
 
       throw new Error("Unexpected request");
     });
+
+    const SettingsPanel = await importSettingsPanel();
 
     render(<SettingsPanel />);
 
@@ -225,6 +271,8 @@ describe("SettingsPanel", () => {
       .mockResolvedValueOnce({ ok: false, status: 401 } as Response)
       .mockResolvedValueOnce({ ok: true, status: 200 } as Response);
 
+    const SettingsPanel = await importSettingsPanel();
+
     render(<SettingsPanel />);
 
     const apiKeyInput = await screen.findByLabelText("API Key");
@@ -238,5 +286,173 @@ describe("SettingsPanel", () => {
 
     await userEvent.click(validateButton);
     expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe("SettingsPanel persistence fallback", () => {
+  const setupLocalStorage = () => {
+    const storage = new Map<string, string>();
+
+    const localStorageStub: Storage = {
+      get length() {
+        return storage.size;
+      },
+      clear: vi.fn(() => storage.clear()),
+      getItem: vi.fn((key: string) => storage.get(key) ?? null),
+      key: vi.fn((index: number) => Array.from(storage.keys())[index] ?? null),
+      removeItem: vi.fn((key: string) => {
+        storage.delete(key);
+      }),
+      setItem: vi.fn((key: string, value: string) => {
+        storage.set(key, value);
+      }),
+    };
+
+    Object.defineProperty(window, "localStorage", {
+      value: localStorageStub,
+      configurable: true,
+    });
+
+    return { storage, localStorageStub };
+  };
+
+  const setupBroadcastChannel = () => {
+    type Listener = (event: MessageEvent) => void;
+    const listenersByName = new Map<string, Map<EventListenerOrEventListenerObject, Listener>>();
+
+    class BroadcastChannelStub implements BroadcastChannel {
+      static listenerRegistry = new Map<string, Set<Listener>>();
+      readonly name: string;
+      onmessage: ((this: BroadcastChannel, ev: MessageEvent) => unknown) | null = null;
+      onmessageerror: ((this: BroadcastChannel, ev: MessageEvent) => unknown) | null = null;
+
+      constructor(name: string) {
+        this.name = name;
+        if (!BroadcastChannelStub.listenerRegistry.has(name)) {
+          BroadcastChannelStub.listenerRegistry.set(name, new Set());
+        }
+        if (!listenersByName.has(name)) {
+          listenersByName.set(name, new Map());
+        }
+      }
+
+      postMessage(message: unknown): void {
+        const listeners = BroadcastChannelStub.listenerRegistry.get(this.name);
+        if (!listeners) {
+          return;
+        }
+
+        const event = new MessageEvent("message", { data: message, origin: "" });
+        listeners.forEach((listener) => listener.call(this, event));
+        this.onmessage?.call(this, event);
+      }
+
+      close(): void {
+        const listeners = BroadcastChannelStub.listenerRegistry.get(this.name);
+        const instanceRegistry = listenersByName.get(this.name);
+        instanceRegistry?.forEach((handler) => {
+          listeners?.delete(handler);
+        });
+        instanceRegistry?.clear();
+      }
+
+      addEventListener(type: string, listener: EventListenerOrEventListenerObject): void {
+        if (type !== "message") {
+          return;
+        }
+
+        const listeners = BroadcastChannelStub.listenerRegistry.get(this.name);
+        const instanceRegistry = listenersByName.get(this.name);
+        if (!listeners || !instanceRegistry) {
+          return;
+        }
+
+        const handler: Listener = (event: MessageEvent) => {
+          if (typeof listener === "function") {
+            listener.call(this, event);
+          } else {
+            listener.handleEvent(event);
+          }
+        };
+
+        listeners.add(handler);
+        instanceRegistry.set(listener, handler);
+      }
+
+      removeEventListener(type: string, listener: EventListenerOrEventListenerObject): void {
+        if (type !== "message") {
+          return;
+        }
+
+        const listeners = BroadcastChannelStub.listenerRegistry.get(this.name);
+        const instanceRegistry = listenersByName.get(this.name);
+        if (!listeners || !instanceRegistry) {
+          return;
+        }
+
+        const handler = instanceRegistry.get(listener);
+        if (handler) {
+          listeners.delete(handler);
+          instanceRegistry.delete(listener);
+        }
+      }
+
+      dispatchEvent(_event: Event): boolean {
+        return false;
+      }
+    }
+
+    vi.stubGlobal("BroadcastChannel", BroadcastChannelStub);
+
+    return { BroadcastChannelStub };
+  };
+
+  beforeEach(() => {
+    vi.resetModules();
+    vi.restoreAllMocks();
+    setupLocalStorage();
+    setupBroadcastChannel();
+    vi.doMock(SUPABASE_CLIENT_PATH, () => ({
+      getSupabaseClient: () => {
+        throw new Error("Supabase unavailable");
+      },
+    }));
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.doUnmock(SUPABASE_CLIENT_PATH);
+    delete (window as Partial<Window>).localStorage;
+  });
+
+  it("persists settings locally when Supabase cannot be instantiated", async () => {
+    const SettingsPanel = await importSettingsPanel();
+
+    const { unmount } = render(<SettingsPanel />);
+
+    const apiKeyInput = await screen.findByLabelText("API Key");
+    await userEvent.clear(apiKeyInput);
+    await userEvent.type(apiKeyInput, "sk-or-fallbackapikey1234");
+
+    const webSearchToggle = screen.getByLabelText("Enable OpenRouter web search augmentation");
+    expect((webSearchToggle as HTMLInputElement).checked).toBe(false);
+    await userEvent.click(webSearchToggle);
+
+    await waitFor(() => {
+      const stored = window.localStorage.getItem("app_state:settings_preferences");
+      expect(stored).toContain("sk-or-fallbackapikey1234");
+    });
+
+    unmount();
+
+    const secondRender = render(<SettingsPanel />);
+
+    const persistedApiKey = await screen.findByLabelText("API Key");
+    expect((persistedApiKey as HTMLInputElement).value).toBe("sk-or-fallbackapikey1234");
+
+    const persistedWebToggle = screen.getByLabelText("Enable OpenRouter web search augmentation");
+    expect((persistedWebToggle as HTMLInputElement).checked).toBe(true);
+
+    secondRender.unmount();
   });
 });
