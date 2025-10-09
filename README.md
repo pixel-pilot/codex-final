@@ -50,4 +50,4 @@ The **Usage & Costs** tab displays the most recent automated QA report. Updating
 
 ## Accessibility and reliability
 
-The Playwright suite enforces an axe-core accessibility audit, and unit tests validate localStorage persistence, cross-tab synchronization, and error handling to guard against regressions in the grid, toggle loop, settings, and logging subsystems.
+The Playwright suite enforces an axe-core accessibility audit, and unit tests validate Supabase-backed persistence, cross-tab synchronization, and error handling to guard against regressions in the grid, toggle loop, settings, and logging subsystems.

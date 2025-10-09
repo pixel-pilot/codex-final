@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import CoreGrid, {
   INITIAL_ROW_COUNT,
   GridRow,
@@ -11,6 +11,19 @@ import CoreGrid, {
 } from "./CoreGrid";
 import SettingsPanel from "./SettingsPanel";
 import UpdatesPanel from "./UpdatesPanel";
+import {
+  loadGridRows,
+  loadColumnWidths,
+  loadErrorLog,
+  saveColumnWidths,
+  saveErrorLog,
+  saveGridRows,
+  StoredErrorLogEntry,
+  subscribeToColumnWidths,
+  subscribeToErrorLog,
+  subscribeToGridRows,
+} from "../../lib/gridRepository";
+import { loadSettingsState, subscribeToSettingsState } from "../../lib/settingsRepository";
 
 type TabId = "generate" | "settings" | "usage" | "updates";
 
@@ -33,13 +46,7 @@ type UsageEntry = {
   timestamp: string;
 };
 
-type ErrorLogEntry = {
-  id: string;
-  rowId: string;
-  message: string;
-  timestamp: string;
-  retries: number;
-};
+type ErrorLogEntry = StoredErrorLogEntry;
 
 type GridFilters = {
   input: string;
@@ -48,10 +55,6 @@ type GridFilters = {
   lenMax: string;
 };
 
-const ROW_STORAGE_KEY = "reactive-ai-spreadsheet-rows";
-const COLUMN_WIDTH_STORAGE_KEY = "reactive-ai-spreadsheet-column-widths";
-const ERROR_LOG_STORAGE_KEY = "reactive-ai-spreadsheet-error-log";
-const RATE_LIMIT_EVENT = "reactive-ai:settings-rate-limit-changed";
 const DEFAULT_RATE_LIMIT = 120;
 const MAX_ERROR_LOG_ENTRIES = 80;
 const QA_REPORT_ENDPOINT = "/qa/latest.json";
@@ -184,34 +187,55 @@ export default function HomeContent() {
   const [errorLogHydrated, setErrorLogHydrated] = useState(false);
   const [dateRange, setDateRange] = useState("last30");
   const [customRange, setCustomRange] = useState({ start: "", end: "" });
+  const [rateLimitPerMinute, setRateLimitPerMinute] = useState(DEFAULT_RATE_LIMIT);
   const [qaStatus, setQaStatus] = useState<QaStatusState>({
     state: "loading",
     report: null,
     error: null,
   });
+  const lastPersistedRows = useRef<string | null>(null);
+  const lastPersistedWidths = useRef<string | null>(null);
+  const lastPersistedErrorLog = useRef<string | null>(null);
 
   useEffect(() => {
-    if (typeof window === "undefined") {
-      return;
-    }
+    let cancelled = false;
 
-    try {
-      const stored = window.localStorage.getItem(ROW_STORAGE_KEY);
-      if (stored) {
-        const parsed = JSON.parse(stored);
-        if (Array.isArray(parsed)) {
-          const normalized = parsed
-            .map((entry) => (entry ? ensureRowInitialized(entry as GridRow) : null))
-            .filter((row): row is GridRow => Boolean(row));
-
-          setRows(normalized);
+    const hydrateRows = async () => {
+      try {
+        const stored = await loadGridRows();
+        if (!cancelled && stored.length) {
+          setRows(stored);
+          lastPersistedRows.current = JSON.stringify(stored);
+        }
+      } catch (error) {
+        console.error("Unable to restore grid rows", error);
+      } finally {
+        if (!cancelled) {
+          setRowsHydrated(true);
         }
       }
-    } catch (error) {
-      console.error("Unable to restore grid rows", error);
-    } finally {
+    };
+
+    hydrateRows();
+    const unsubscribe = subscribeToGridRows((stored) => {
+      if (cancelled) {
+        return;
+      }
+
+      const serialized = JSON.stringify(stored);
+      if (lastPersistedRows.current === serialized) {
+        return;
+      }
+
+      lastPersistedRows.current = serialized;
+      setRows(stored.length ? stored : seedRows());
       setRowsHydrated(true);
-    }
+    });
+
+    return () => {
+      cancelled = true;
+      unsubscribe();
+    };
   }, []);
 
   useEffect(() => {
@@ -219,236 +243,130 @@ export default function HomeContent() {
       return;
     }
 
-    const clampRateLimit = (value: number | null | undefined): number => {
+    const clampRateLimit = (value: number | "" | null | undefined): number => {
+      if (value === "") {
+        return DEFAULT_RATE_LIMIT;
+      }
+
       if (typeof value !== "number" || Number.isNaN(value) || !Number.isFinite(value)) {
         return DEFAULT_RATE_LIMIT;
       }
+
       return Math.min(Math.max(Math.round(value), 1), 250);
     };
 
-    const syncFromStorage = () => {
+    let cancelled = false;
+
+    const hydrateRateLimit = async () => {
       try {
-        const raw = window.localStorage.getItem(SETTINGS_STORAGE_KEY);
-        if (!raw) {
-          setRateLimitPerMinute(DEFAULT_RATE_LIMIT);
-          return;
+        const stored = await loadSettingsState();
+        if (!cancelled) {
+          const next = clampRateLimit(stored?.rateLimitPerMinute);
+          setRateLimitPerMinute(next);
         }
-
-        const parsed = JSON.parse(raw) as { rateLimitPerMinute?: unknown } | null;
-        const next = clampRateLimit(
-          parsed && typeof parsed === "object"
-            ? (parsed.rateLimitPerMinute as number | null | undefined)
-            : null,
-        );
-        setRateLimitPerMinute(next);
       } catch (error) {
-        console.error("Unable to sync rate limit preference", error);
+        console.error("Unable to hydrate rate limit preference", error);
       }
     };
 
-    const handleCustomRateLimit = (event: Event) => {
-      if (!("detail" in event)) {
+    hydrateRateLimit();
+    const unsubscribe = subscribeToSettingsState((payload) => {
+      if (cancelled) {
         return;
       }
-      const detail = (event as CustomEvent<{ value: number | null }>).detail;
-      if (!detail) {
-        setRateLimitPerMinute(DEFAULT_RATE_LIMIT);
-        return;
-      }
-
-      setRateLimitPerMinute(clampRateLimit(detail.value));
-    };
-
-    const handleStorage = (event: StorageEvent) => {
-      if (event.key && event.key !== SETTINGS_STORAGE_KEY) {
-        return;
-      }
-      syncFromStorage();
-    };
-
-    syncFromStorage();
-    window.addEventListener(RATE_LIMIT_EVENT, handleCustomRateLimit as EventListener);
-    window.addEventListener("storage", handleStorage);
+      const next = clampRateLimit(payload?.rateLimitPerMinute);
+      setRateLimitPerMinute(next);
+    });
 
     return () => {
-      window.removeEventListener(RATE_LIMIT_EVENT, handleCustomRateLimit as EventListener);
-      window.removeEventListener("storage", handleStorage);
+      cancelled = true;
+      unsubscribe();
     };
   }, []);
 
   useEffect(() => {
-    if (typeof window === "undefined") {
-      return;
-    }
+    let cancelled = false;
 
-    try {
-      const stored = window.localStorage.getItem(COLUMN_WIDTH_STORAGE_KEY);
-      if (stored) {
-        const parsed = JSON.parse(stored) as Partial<ColumnWidths> | null;
-        if (parsed && typeof parsed === "object") {
-          setColumnWidths((previous) => ({ ...previous, ...parsed }));
+    const hydrateColumnWidths = async () => {
+      try {
+        const stored = await loadColumnWidths();
+        if (!cancelled && Object.keys(stored).length) {
+          setColumnWidths((previous) => ({ ...previous, ...stored }));
+          lastPersistedWidths.current = JSON.stringify({ ...columnWidths, ...stored });
+        }
+      } catch (error) {
+        console.error("Unable to restore column widths", error);
+      } finally {
+        if (!cancelled) {
+          setColumnWidthsHydrated(true);
         }
       }
-    } catch (error) {
-      console.error("Unable to restore column widths", error);
-    } finally {
+    };
+
+    hydrateColumnWidths();
+
+    const unsubscribe = subscribeToColumnWidths((stored) => {
+      if (cancelled) {
+        return;
+      }
+
+      const serialized = JSON.stringify(stored);
+      if (lastPersistedWidths.current === serialized) {
+        return;
+      }
+
+      lastPersistedWidths.current = serialized;
+      setColumnWidths((previous) => ({ ...previous, ...stored }));
       setColumnWidthsHydrated(true);
-    }
+    });
+
+    return () => {
+      cancelled = true;
+      unsubscribe();
+    };
   }, []);
 
   useEffect(() => {
-    if (typeof window === "undefined") {
-      return;
-    }
+    let cancelled = false;
 
-    try {
-      const stored = window.localStorage.getItem(ERROR_LOG_STORAGE_KEY);
-      if (stored) {
-        const parsed = JSON.parse(stored);
-        if (Array.isArray(parsed)) {
-          const normalized = parsed
-            .map((entry) => {
-              if (!entry || typeof entry !== "object") {
-                return null;
-              }
-
-              const candidate = entry as Partial<ErrorLogEntry>;
-              if (
-                typeof candidate.id === "string" &&
-                typeof candidate.rowId === "string" &&
-                typeof candidate.message === "string" &&
-                typeof candidate.timestamp === "string"
-              ) {
-                return {
-                  id: candidate.id,
-                  rowId: candidate.rowId,
-                  message: candidate.message,
-                  timestamp: candidate.timestamp,
-                  retries: typeof candidate.retries === "number" ? candidate.retries : 0,
-                } as ErrorLogEntry;
-              }
-
-              return null;
-            })
-            .filter((entry): entry is ErrorLogEntry => Boolean(entry));
-          if (normalized.length) {
-            setErrorLog(normalized.slice(0, MAX_ERROR_LOG_ENTRIES));
-          }
+    const hydrateErrorLog = async () => {
+      try {
+        const stored = await loadErrorLog();
+        if (!cancelled && stored.length) {
+          const normalized = stored.slice(0, MAX_ERROR_LOG_ENTRIES);
+          setErrorLog(normalized);
+          lastPersistedErrorLog.current = JSON.stringify(normalized);
         }
-      }
-    } catch (error) {
-      console.error("Unable to restore error log", error);
-    } finally {
-      setErrorLogHydrated(true);
-    }
-  }, []);
-
-  useEffect(() => {
-    if (!rowsHydrated || typeof window === "undefined") {
-      return;
-    }
-
-    try {
-      window.localStorage.setItem(ROW_STORAGE_KEY, JSON.stringify(rows));
-    } catch (error) {
-      console.error("Unable to persist grid rows", error);
-    }
-  }, [rows, rowsHydrated]);
-
-  useEffect(() => {
-    if (!columnWidthsHydrated || typeof window === "undefined") {
-      return;
-    }
-
-    try {
-      window.localStorage.setItem(
-        COLUMN_WIDTH_STORAGE_KEY,
-        JSON.stringify(columnWidths),
-      );
-    } catch (error) {
-      console.error("Unable to persist column widths", error);
-    }
-  }, [columnWidths, columnWidthsHydrated]);
-
-  useEffect(() => {
-    if (!errorLogHydrated || typeof window === "undefined") {
-      return;
-    }
-
-    try {
-      window.localStorage.setItem(ERROR_LOG_STORAGE_KEY, JSON.stringify(errorLog));
-    } catch (error) {
-      console.error("Unable to persist error log", error);
-    }
-  }, [errorLog, errorLogHydrated]);
-
-  useEffect(() => {
-    if (typeof window === "undefined") {
-      return;
-    }
-
-    const handleStorage = (event: StorageEvent) => {
-      if (event.key === ROW_STORAGE_KEY && event.newValue) {
-        try {
-          const parsed = JSON.parse(event.newValue);
-          if (Array.isArray(parsed)) {
-            const normalized = parsed
-              .map((entry) => (entry ? ensureRowInitialized(entry as GridRow) : null))
-              .filter((row): row is GridRow => Boolean(row));
-            setRows(normalized);
-          }
-        } catch (error) {
-          console.error("Unable to sync grid rows", error);
-        }
-      } else if (event.key === COLUMN_WIDTH_STORAGE_KEY && event.newValue) {
-        try {
-          const parsed = JSON.parse(event.newValue) as Partial<ColumnWidths> | null;
-          if (parsed && typeof parsed === "object") {
-            setColumnWidths((previous) => ({ ...previous, ...parsed }));
-          }
-        } catch (error) {
-          console.error("Unable to sync column widths", error);
-        }
-      } else if (event.key === ERROR_LOG_STORAGE_KEY && event.newValue) {
-        try {
-          const parsed = JSON.parse(event.newValue);
-          if (Array.isArray(parsed)) {
-            const normalized = parsed
-              .map((entry) => {
-                if (!entry || typeof entry !== "object") {
-                  return null;
-                }
-
-                const candidate = entry as Partial<ErrorLogEntry>;
-                if (
-                  typeof candidate.id === "string" &&
-                  typeof candidate.rowId === "string" &&
-                  typeof candidate.message === "string" &&
-                  typeof candidate.timestamp === "string"
-                ) {
-                  return {
-                    id: candidate.id,
-                    rowId: candidate.rowId,
-                    message: candidate.message,
-                    timestamp: candidate.timestamp,
-                    retries: typeof candidate.retries === "number" ? candidate.retries : 0,
-                  } as ErrorLogEntry;
-                }
-
-                return null;
-              })
-              .filter((entry): entry is ErrorLogEntry => Boolean(entry));
-            setErrorLog(normalized.slice(0, MAX_ERROR_LOG_ENTRIES));
-          }
-        } catch (error) {
-          console.error("Unable to sync error log", error);
+      } catch (error) {
+        console.error("Unable to restore error log", error);
+      } finally {
+        if (!cancelled) {
+          setErrorLogHydrated(true);
         }
       }
     };
 
-    window.addEventListener("storage", handleStorage);
+    hydrateErrorLog();
+
+    const unsubscribe = subscribeToErrorLog((stored) => {
+      if (cancelled) {
+        return;
+      }
+
+      const normalized = stored.slice(0, MAX_ERROR_LOG_ENTRIES);
+      const serialized = JSON.stringify(normalized);
+      if (lastPersistedErrorLog.current === serialized) {
+        return;
+      }
+
+      lastPersistedErrorLog.current = serialized;
+      setErrorLog(normalized);
+      setErrorLogHydrated(true);
+    });
+
     return () => {
-      window.removeEventListener("storage", handleStorage);
+      cancelled = true;
+      unsubscribe();
     };
   }, []);
 
@@ -514,6 +432,76 @@ export default function HomeContent() {
       return mutated ? next : previous;
     });
   }, [rows]);
+
+  useEffect(() => {
+    if (!rowsHydrated) {
+      return;
+    }
+
+    const serialized = JSON.stringify(rows);
+    if (lastPersistedRows.current === serialized) {
+      return;
+    }
+
+    lastPersistedRows.current = serialized;
+
+    const persist = async () => {
+      try {
+        await saveGridRows(rows);
+      } catch (error) {
+        console.error("Unable to persist grid rows", error);
+      }
+    };
+
+    void persist();
+  }, [rows, rowsHydrated]);
+
+  useEffect(() => {
+    if (!columnWidthsHydrated) {
+      return;
+    }
+
+    const serialized = JSON.stringify(columnWidths);
+    if (lastPersistedWidths.current === serialized) {
+      return;
+    }
+
+    lastPersistedWidths.current = serialized;
+
+    const persist = async () => {
+      try {
+        await saveColumnWidths(columnWidths);
+      } catch (error) {
+        console.error("Unable to persist column widths", error);
+      }
+    };
+
+    void persist();
+  }, [columnWidths, columnWidthsHydrated]);
+
+  useEffect(() => {
+    if (!errorLogHydrated) {
+      return;
+    }
+
+    const normalized = errorLog.slice(0, MAX_ERROR_LOG_ENTRIES);
+    const serialized = JSON.stringify(normalized);
+    if (lastPersistedErrorLog.current === serialized) {
+      return;
+    }
+
+    lastPersistedErrorLog.current = serialized;
+
+    const persist = async () => {
+      try {
+        await saveErrorLog(normalized as StoredErrorLogEntry[]);
+      } catch (error) {
+        console.error("Unable to persist error log", error);
+      }
+    };
+
+    void persist();
+  }, [errorLog, errorLogHydrated]);
 
   const displayedRowIndices = useMemo(() => {
     const inputFilter = gridFilters.input.trim().toLowerCase();

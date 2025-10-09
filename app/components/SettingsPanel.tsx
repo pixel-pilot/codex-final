@@ -7,26 +7,20 @@ import {
   useRef,
   useState,
 } from "react";
-
-type OpenRouterModel = {
-  id: string;
-  name?: string;
-  description?: string;
-  pricing?: {
-    prompt?: number | string | null;
-    completion?: number | string | null;
-  } | null;
-};
-
-type ModelNotification = {
-  id: string;
-  name: string;
-  timestamp: number;
-};
+import {
+  type ModelNotification,
+  type OpenRouterModel,
+  type PersistedModelCatalog,
+  type PersistedSettingsState,
+  loadModelCatalog,
+  loadSettingsState,
+  saveModelCatalog,
+  saveSettingsState,
+  subscribeToModelCatalog,
+  subscribeToSettingsState,
+} from "../../lib/settingsRepository";
 
 const NOTIFICATION_TTL_MS = 72 * 60 * 60 * 1000;
-export const SETTINGS_STORAGE_KEY = "reactive-ai-settings-preferences";
-const MODEL_CATALOG_STORAGE_KEY = "reactive-ai-model-catalog";
 const MODEL_CATALOG_TTL_MS = 24 * 60 * 60 * 1000;
 
 const API_KEY_PATTERN = /^sk-or-[a-zA-Z0-9]{16,}$/;
@@ -182,6 +176,114 @@ export default function SettingsPanel() {
   const [settingsHydrated, setSettingsHydrated] = useState(false);
   const [catalogHydrated, setCatalogHydrated] = useState(false);
   const [areNotificationsOpen, setAreNotificationsOpen] = useState(false);
+  const lastPersistedSettings = useRef<string | null>(null);
+  const lastPersistedCatalog = useRef<string | null>(null);
+
+  const applySettingsPayload = (payload: PersistedSettingsState | null) => {
+    if (!payload) {
+      return;
+    }
+
+    setApiKey(typeof payload.apiKey === "string" ? payload.apiKey : "");
+    setSelectedModelId(
+      typeof payload.selectedModelId === "string" ? payload.selectedModelId : "",
+    );
+    setWebSearchEnabled(Boolean(payload.webSearchEnabled));
+    setMaxTokens((previous) => coerceNumericSetting(payload.maxTokens, previous));
+    setTemperature((previous) => coerceNumericSetting(payload.temperature, previous));
+    setRepetitionPenalty((previous) =>
+      coerceNumericSetting(payload.repetitionPenalty, previous),
+    );
+    setTopP((previous) => coerceNumericSetting(payload.topP, previous));
+    setTopK((previous) => coerceNumericSetting(payload.topK, previous));
+    if (
+      payload.reasoningLevel === "off" ||
+      payload.reasoningLevel === "standard" ||
+      payload.reasoningLevel === "deep"
+    ) {
+      setReasoningLevel(payload.reasoningLevel);
+    }
+    setRateLimitPerMinute((previous) =>
+      coerceNumericSetting(payload.rateLimitPerMinute, previous),
+    );
+    const entries = Array.isArray(payload.knownModelIds)
+      ? payload.knownModelIds.reduce<Record<string, true>>((accumulator, value) => {
+          if (typeof value === "string" && value.trim()) {
+            accumulator[value] = true;
+          }
+          return accumulator;
+        }, {})
+      : {};
+    setKnownModelIds(entries);
+    setModelNotifications(sanitizeNotifications(payload.modelNotifications));
+  };
+
+  const buildSettingsPayload = (): PersistedSettingsState => ({
+    apiKey,
+    selectedModelId,
+    webSearchEnabled,
+    maxTokens,
+    temperature,
+    repetitionPenalty,
+    topP,
+    topK,
+    reasoningLevel,
+    rateLimitPerMinute,
+    knownModelIds: Object.keys(knownModelIds),
+    modelNotifications: sanitizeNotifications(modelNotifications),
+  });
+
+  const applyModelCatalogPayload = (payload: PersistedModelCatalog | null) => {
+    if (!payload) {
+      return;
+    }
+
+    if (typeof payload.storedAt !== "number" || Date.now() - payload.storedAt > MODEL_CATALOG_TTL_MS) {
+      return;
+    }
+
+    const normalizedModels = Array.isArray(payload.models)
+      ? payload.models
+          .map((model) => {
+            if (!model || typeof model !== "object") {
+              return null;
+            }
+
+            const entry = model as OpenRouterModel;
+            if (typeof entry.id !== "string") {
+              return null;
+            }
+
+            return { ...entry, id: entry.id } satisfies OpenRouterModel;
+          })
+          .filter((entry): entry is OpenRouterModel => Boolean(entry))
+      : [];
+
+    if (normalizedModels.length) {
+      normalizedModels.sort((a, b) => a.id.localeCompare(b.id));
+      setModels(normalizedModels);
+      setKnownModelIds((previous) => {
+        const merged = { ...previous };
+        for (const model of normalizedModels) {
+          merged[model.id] = true;
+        }
+        return merged;
+      });
+    }
+
+    if (
+      typeof payload.lastFetchedAt === "number" &&
+      Number.isFinite(payload.lastFetchedAt)
+    ) {
+      setLastFetchedAt(payload.lastFetchedAt);
+    }
+  };
+
+  const buildModelCatalogPayload = (): PersistedModelCatalog => ({
+    models,
+    lastFetchedAt,
+    storedAt: Date.now(),
+  });
 
   useEffect(() => {
     const pruneNotifications = () => {
@@ -200,93 +302,75 @@ export default function SettingsPanel() {
   }, []);
 
   useEffect(() => {
-    if (typeof window === "undefined") {
-      return;
-    }
+    let cancelled = false;
 
-    try {
-      const stored = window.localStorage.getItem(SETTINGS_STORAGE_KEY);
-      if (!stored) {
+    const hydrate = async () => {
+      try {
+        const stored = await loadSettingsState();
+        if (cancelled) {
+          return;
+        }
+
+        if (stored) {
+          applySettingsPayload(stored);
+          lastPersistedSettings.current = JSON.stringify(stored);
+        } else {
+          lastPersistedSettings.current = null;
+        }
+      } catch (error) {
+        console.error("Unable to restore settings preferences", error);
+      } finally {
+        if (!cancelled) {
+          setSettingsHydrated(true);
+        }
+      }
+    };
+
+    hydrate();
+
+    const unsubscribe = subscribeToSettingsState((payload) => {
+      if (cancelled) {
         return;
       }
 
-      const parsed = JSON.parse(stored) as Partial<PersistedSettingsState> | null;
-      if (!parsed || typeof parsed !== "object") {
+      const serialized = payload ? JSON.stringify(payload) : null;
+      if (serialized === lastPersistedSettings.current) {
         return;
       }
 
-      if (typeof parsed.apiKey === "string") {
-        setApiKey(parsed.apiKey);
-      }
-
-      if (typeof parsed.selectedModelId === "string") {
-        setSelectedModelId(parsed.selectedModelId);
-      }
-
-      if (typeof parsed.webSearchEnabled === "boolean") {
-        setWebSearchEnabled(parsed.webSearchEnabled);
-      }
-
-      setMaxTokens((previous) => coerceNumericSetting(parsed.maxTokens, previous));
-      setTemperature((previous) => coerceNumericSetting(parsed.temperature, previous));
-      setRepetitionPenalty((previous) => coerceNumericSetting(parsed.repetitionPenalty, previous));
-      setTopP((previous) => coerceNumericSetting(parsed.topP, previous));
-      setTopK((previous) => coerceNumericSetting(parsed.topK, previous));
-
-      if (parsed.reasoningLevel === "off" || parsed.reasoningLevel === "standard" || parsed.reasoningLevel === "deep") {
-        setReasoningLevel(parsed.reasoningLevel);
-      }
-
-      setRateLimitPerMinute((previous) => coerceNumericSetting(parsed.rateLimitPerMinute, previous));
-
-      if (Array.isArray(parsed.knownModelIds)) {
-        const storedKnownIds = parsed.knownModelIds;
-        setKnownModelIds(() => {
-          const entries = storedKnownIds.reduce<Record<string, true>>((accumulator, value) => {
-            if (typeof value === "string" && value.trim()) {
-              accumulator[value] = true;
-            }
-            return accumulator;
-          }, {});
-          return entries;
-        });
-      }
-
-      if (parsed.modelNotifications) {
-        setModelNotifications(sanitizeNotifications(parsed.modelNotifications));
-      }
-    } catch (error) {
-      console.error("Unable to restore settings preferences", error);
-    } finally {
+      lastPersistedSettings.current = serialized;
+      applySettingsPayload(payload);
       setSettingsHydrated(true);
-    }
+    });
+
+    return () => {
+      cancelled = true;
+      unsubscribe();
+    };
   }, []);
 
   useEffect(() => {
-    if (!settingsHydrated || typeof window === "undefined") {
+    if (!settingsHydrated) {
       return;
     }
 
-    const payload: PersistedSettingsState = {
-      apiKey,
-      selectedModelId,
-      webSearchEnabled,
-      maxTokens,
-      temperature,
-      repetitionPenalty,
-      topP,
-      topK,
-      reasoningLevel,
-      rateLimitPerMinute,
-      knownModelIds: Object.keys(knownModelIds),
-      modelNotifications: sanitizeNotifications(modelNotifications),
+    const payload = buildSettingsPayload();
+    const serialized = JSON.stringify(payload);
+    if (serialized === lastPersistedSettings.current) {
+      return;
+    }
+
+    lastPersistedSettings.current = serialized;
+
+    const persist = async () => {
+      try {
+        await saveSettingsState(payload);
+      } catch (error) {
+        console.error("Unable to persist settings preferences", error);
+      }
     };
 
-    try {
-      window.localStorage.setItem(SETTINGS_STORAGE_KEY, JSON.stringify(payload));
-    } catch (error) {
-      console.error("Unable to persist settings preferences", error);
-    }
+    void persist();
   }, [
     apiKey,
     knownModelIds,
@@ -304,69 +388,55 @@ export default function SettingsPanel() {
   ]);
 
   useEffect(() => {
-    if (typeof window === "undefined") {
-      return;
-    }
+    let cancelled = false;
 
-    try {
-      const stored = window.localStorage.getItem(MODEL_CATALOG_STORAGE_KEY);
-      if (!stored) {
-        return;
-      }
+    const hydrate = async () => {
+      try {
+        const stored = await loadModelCatalog();
+        if (cancelled) {
+          return;
+        }
 
-      const parsed = JSON.parse(stored) as PersistedModelCatalog | null;
-      if (!parsed || typeof parsed !== "object") {
-        return;
-      }
-
-      if (typeof parsed.storedAt !== "number" || Date.now() - parsed.storedAt > MODEL_CATALOG_TTL_MS) {
-        return;
-      }
-
-      if (Array.isArray(parsed.models)) {
-        const normalized = parsed.models
-          .map((model) => {
-            if (!model || typeof model !== "object") {
-              return null;
-            }
-
-            const entry = model as OpenRouterModel;
-            if (typeof entry.id !== "string") {
-              return null;
-            }
-
-            return {
-              ...entry,
-              id: entry.id,
-            } satisfies OpenRouterModel;
-          })
-          .filter((entry): entry is OpenRouterModel => Boolean(entry));
-
-        if (normalized.length) {
-          normalized.sort((a, b) => a.id.localeCompare(b.id));
-          setModels(normalized);
-          setKnownModelIds((previous) => {
-            const merged = { ...previous };
-            for (const model of normalized) {
-              merged[model.id] = true;
-            }
-            return merged;
-          });
+        if (stored) {
+          applyModelCatalogPayload(stored);
+          lastPersistedCatalog.current = JSON.stringify(stored);
+        } else {
+          lastPersistedCatalog.current = null;
+        }
+      } catch (error) {
+        console.error("Unable to restore cached model catalog", error);
+      } finally {
+        if (!cancelled) {
+          setCatalogHydrated(true);
         }
       }
+    };
 
-      if (typeof parsed.lastFetchedAt === "number" && Number.isFinite(parsed.lastFetchedAt)) {
-        setLastFetchedAt(parsed.lastFetchedAt);
+    hydrate();
+
+    const unsubscribe = subscribeToModelCatalog((payload) => {
+      if (cancelled) {
+        return;
       }
-    } catch (error) {
-      console.error("Unable to restore cached model catalog", error);
-    } finally {
+
+      const serialized = payload ? JSON.stringify(payload) : null;
+      if (serialized === lastPersistedCatalog.current) {
+        return;
+      }
+
+      lastPersistedCatalog.current = serialized;
+      applyModelCatalogPayload(payload);
       setCatalogHydrated(true);
-    }
+    });
+
+    return () => {
+      cancelled = true;
+      unsubscribe();
+    };
   }, []);
 
   useEffect(() => {
-    if (!catalogHydrated || typeof window === "undefined") {
+    if (!catalogHydrated) {
       return;
     }
 
@@ -374,17 +444,23 @@ export default function SettingsPanel() {
       return;
     }
 
-    const payload: PersistedModelCatalog = {
-      models,
-      lastFetchedAt,
-      storedAt: Date.now(),
+    const payload = buildModelCatalogPayload();
+    const serialized = JSON.stringify(payload);
+    if (serialized === lastPersistedCatalog.current) {
+      return;
+    }
+
+    lastPersistedCatalog.current = serialized;
+
+    const persist = async () => {
+      try {
+        await saveModelCatalog(payload);
+      } catch (error) {
+        console.error("Unable to persist model catalog", error);
+      }
     };
 
-    try {
-      window.localStorage.setItem(MODEL_CATALOG_STORAGE_KEY, JSON.stringify(payload));
-    } catch (error) {
-      console.error("Unable to persist model catalog", error);
-    }
+    void persist();
   }, [catalogHydrated, lastFetchedAt, models]);
 
   useEffect(() => {
