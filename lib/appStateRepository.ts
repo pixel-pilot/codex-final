@@ -15,7 +15,7 @@ export const loadState = async <T>(key: string): Promise<T | null> => {
   const client = getSupabaseClient();
 
   const { data, error } = await client
-    .from<AppStateRow<T>>(TABLE_NAME)
+    .from(TABLE_NAME)
     .select("payload")
     .eq("key", key)
     .maybeSingle();
@@ -24,7 +24,9 @@ export const loadState = async <T>(key: string): Promise<T | null> => {
     throw error;
   }
 
-  return (data?.payload ?? null) as T | null;
+  const record = data as AppStateRow<T> | null;
+
+  return record?.payload ?? null;
 };
 
 export const saveState = async <T>(key: string, payload: T): Promise<void> => {
