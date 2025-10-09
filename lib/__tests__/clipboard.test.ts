@@ -42,11 +42,22 @@ describe("extractClipboardValues", () => {
     expect(extractClipboardValues(clipboard)).toEqual(["Row 1", "Row 2"]);
   });
 
-  it("preserves lone newlines within a single row on plain text pastes", () => {
+  it("treats bare line feeds as row delimiters in plain text", () => {
     const clipboard = createClipboard({
-      "text/plain": "First line\nSecond line",
+      "text/plain": "Row A\nRow B\n",
     });
 
-    expect(extractClipboardValues(clipboard)).toEqual(["First line\nSecond line"]);
+    expect(extractClipboardValues(clipboard)).toEqual(["Row A", "Row B"]);
+  });
+
+  it("respects quoted multi-line cells in plain text", () => {
+    const clipboard = createClipboard({
+      "text/plain": '"First line\nSecond line"\n"Third"',
+    });
+
+    expect(extractClipboardValues(clipboard)).toEqual([
+      "First line\nSecond line",
+      "Third",
+    ]);
   });
 });

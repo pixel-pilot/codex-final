@@ -1,5 +1,4 @@
 const BLOCK_LEVEL_SELECTOR = "div,p,li,ul,ol,pre,section,article,blockquote,header,footer,main,h1,h2,h3,h4,h5,h6";
-const SENTINEL = "\uFFFF";
 
 const normalizeCellText = (value: string): string => {
   return value
@@ -62,22 +61,82 @@ const parseHtmlTable = (html: string): string[] => {
   return rows;
 };
 
+/**
+ * Decodes plain-text clipboard payloads emitted by spreadsheets.
+ *
+ * - Treats CRLF, CR, and LF as row delimiters outside of quoted regions.
+ * - Honors Excel/Sheets style quoting rules so multi-line cells remain intact.
+ * - Discards content beyond the first column, matching the grid's single-column input.
+ */
 const parsePlainText = (text: string): string[] => {
   if (!text) {
     return [];
   }
 
-  const normalized = text.replace(/\r\n/g, SENTINEL);
-  const rawRows = normalized.split(SENTINEL).map((row) => row.replace(/\r/g, "\n"));
+  const rows: string[] = [];
+  let buffer = "";
+  let inQuotes = false;
+  let ignoreRestOfRow = false;
 
-  while (rawRows.length && rawRows[rawRows.length - 1] === "") {
-    rawRows.pop();
+  const pushRow = () => {
+    const normalized = buffer.replace(/\u00a0/g, " ");
+    rows.push(normalized);
+    buffer = "";
+    ignoreRestOfRow = false;
+  };
+
+  for (let index = 0; index < text.length; index += 1) {
+    const char = text[index];
+    const nextChar = text[index + 1];
+
+    if (char === "\"") {
+      if (inQuotes && nextChar === "\"") {
+        if (!ignoreRestOfRow) {
+          buffer += "\"";
+        }
+        index += 1;
+        continue;
+      }
+
+      inQuotes = !inQuotes;
+      continue;
+    }
+
+    if (!inQuotes) {
+      if (char === "\t") {
+        ignoreRestOfRow = true;
+        continue;
+      }
+
+      if (char === "\r") {
+        if (nextChar === "\n") {
+          index += 1;
+        }
+
+        pushRow();
+        continue;
+      }
+
+      if (char === "\n") {
+        pushRow();
+        continue;
+      }
+    }
+
+    if (!ignoreRestOfRow) {
+      buffer += char;
+    }
   }
 
-  return rawRows.map((row) => {
-    const firstColumn = row.split("\t")[0] ?? "";
-    return firstColumn.replace(/\u00a0/g, " ");
-  });
+  if (buffer.length || ignoreRestOfRow) {
+    pushRow();
+  }
+
+  while (rows.length && rows[rows.length - 1] === "") {
+    rows.pop();
+  }
+
+  return rows;
 };
 
 export const extractClipboardValues = (clipboardData: DataTransfer | null): string[] => {
