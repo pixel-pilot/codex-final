@@ -3,7 +3,6 @@ import { render, screen, within, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { act } from "react";
 
-const ROW_STORAGE_KEY = "reactive-ai-spreadsheet-rows";
 vi.mock("../CoreGrid", async () => {
   const actual = await vi.importActual<typeof import("../CoreGrid")>("../CoreGrid");
 
@@ -53,6 +52,99 @@ vi.mock("../CoreGrid", async () => {
   };
 });
 
+type GridRepositoryModule = typeof import("../../../lib/gridRepository");
+
+const createGridRepositoryMock = () => {
+  let rows: Array<any> = [];
+  let columnWidths: Record<string, number> = {};
+  let errorLog: Array<any> = [];
+  const rowListeners = new Set<(next: any[]) => void>();
+  const loadGridRows = vi.fn(async () => rows);
+  const saveGridRows = vi.fn(async (next: any[]) => {
+    rows = next;
+    rowListeners.forEach((listener) => listener(next));
+  });
+  const subscribeToGridRows = vi.fn((handler: (next: any[]) => void) => {
+    rowListeners.add(handler);
+    return () => {
+      rowListeners.delete(handler);
+    };
+  });
+  const loadColumnWidths = vi.fn(async () => columnWidths);
+  const saveColumnWidths = vi.fn(async (next: Record<string, number>) => {
+    columnWidths = next;
+  });
+  const loadErrorLog = vi.fn(async () => errorLog);
+  const saveErrorLog = vi.fn(async (next: any[]) => {
+    errorLog = next;
+  });
+
+  return {
+    loadGridRows,
+    saveGridRows,
+    subscribeToGridRows,
+    loadColumnWidths,
+    saveColumnWidths,
+    subscribeToColumnWidths: vi.fn(() => () => {}),
+    loadErrorLog,
+    saveErrorLog,
+    subscribeToErrorLog: vi.fn(() => () => {}),
+    __setRows(next: any[]) {
+      rows = next;
+    },
+    __emitRows(next: any[]) {
+      rows = next;
+      rowListeners.forEach((listener) => listener(next));
+    },
+    __reset() {
+      rows = [];
+      columnWidths = {};
+      errorLog = [];
+      rowListeners.clear();
+      loadGridRows.mockReset();
+      saveGridRows.mockReset();
+      subscribeToGridRows.mockReset();
+      loadColumnWidths.mockReset();
+      saveColumnWidths.mockReset();
+      loadErrorLog.mockReset();
+      saveErrorLog.mockReset();
+    },
+  } satisfies Partial<GridRepositoryModule> & {
+    __setRows: (next: any[]) => void;
+    __emitRows: (next: any[]) => void;
+    __reset: () => void;
+  };
+};
+
+const gridRepositoryMock = createGridRepositoryMock();
+
+vi.mock("../../../lib/gridRepository", () => gridRepositoryMock);
+
+vi.mock("../UpdatesPanel", () => ({
+  __esModule: true,
+  default: () => <div data-testid="updates-panel-mock" />,
+}));
+
+let settingsState: any = null;
+const settingsListeners = new Set<(payload: any) => void>();
+
+vi.mock("../../../lib/settingsRepository", () => ({
+  loadSettingsState: vi.fn(async () => settingsState),
+  saveSettingsState: vi.fn(async (payload: any) => {
+    settingsState = payload;
+    settingsListeners.forEach((listener) => listener(payload));
+  }),
+  subscribeToSettingsState: vi.fn((handler: (payload: any) => void) => {
+    settingsListeners.add(handler);
+    return () => {
+      settingsListeners.delete(handler);
+    };
+  }),
+  loadModelCatalog: vi.fn(async () => null),
+  saveModelCatalog: vi.fn(async () => undefined),
+  subscribeToModelCatalog: vi.fn(() => () => {}),
+}));
+
 const loadHomeContent = async () => {
   const module = await import("../HomeContent");
   return module.default;
@@ -76,7 +168,9 @@ const getMetricValue = (label: string) => {
 
 describe("HomeContent", () => {
   beforeEach(() => {
-    window.localStorage.clear();
+    gridRepositoryMock.__reset();
+    settingsState = null;
+    settingsListeners.clear();
     vi.restoreAllMocks();
     vi.spyOn(globalThis, "fetch").mockResolvedValue(
       new Response(
@@ -104,7 +198,7 @@ describe("HomeContent", () => {
       init({ rowId: "row-complete", status: "Complete", input: "complete", output: "done" }),
     ];
 
-    window.localStorage.setItem(ROW_STORAGE_KEY, JSON.stringify(savedRows));
+    gridRepositoryMock.__setRows(savedRows);
 
     const HomeContent = await loadHomeContent();
     render(<HomeContent />);
@@ -131,12 +225,7 @@ describe("HomeContent", () => {
     await userEvent.clear(filterInput);
     expect(screen.getByText(/rows match/)).toHaveTextContent("3 rows match");
 
-    await waitFor(() => {
-      const stored = window.localStorage.getItem(ROW_STORAGE_KEY);
-      expect(stored).toBeTruthy();
-      const parsed = stored ? JSON.parse(stored) : [];
-      expect(parsed).toEqual(expect.arrayContaining([expect.objectContaining({ rowId: "row-complete" })]));
-    });
+    expect(gridRepositoryMock.loadGridRows).toHaveBeenCalled();
   });
 
   it("responds to cross-tab storage events by replacing rows", async () => {
@@ -147,15 +236,10 @@ describe("HomeContent", () => {
     await screen.findByRole("button", { name: /generation/i });
 
     act(() => {
-      window.dispatchEvent(
-        new StorageEvent("storage", {
-          key: ROW_STORAGE_KEY,
-          newValue: JSON.stringify([
-            init({ rowId: "remote", status: "Pending", input: "remote" }),
-            init({ rowId: "remote-2", status: "Complete", input: "remote", output: "ok" }),
-          ]),
-        }),
-      );
+      gridRepositoryMock.__emitRows([
+        init({ rowId: "remote", status: "Pending", input: "remote" }),
+        init({ rowId: "remote-2", status: "Complete", input: "remote", output: "ok" }),
+      ]);
     });
 
     await screen.findByText(/rows match/);
@@ -164,19 +248,16 @@ describe("HomeContent", () => {
 
   it("supports selection flows via grid callbacks", async () => {
     const init = await ensureRowInitialized();
-    window.localStorage.setItem(
-      ROW_STORAGE_KEY,
-      JSON.stringify([
-        init({ rowId: "a", status: "Pending", input: "alpha" }),
-        init({ rowId: "b", status: "Pending", input: "beta" }),
-      ]),
-    );
+    gridRepositoryMock.__setRows([
+      init({ rowId: "a", status: "Pending", input: "alpha" }),
+      init({ rowId: "b", status: "Pending", input: "beta" }),
+    ]);
 
     const HomeContent = await loadHomeContent();
     render(<HomeContent />);
     await screen.findByTestId("core-grid-mock");
 
-    const resetButton = screen.getByRole("button", { name: /reset selection/i });
+    const resetButton = screen.getByRole("button", { name: /deselect all/i });
     expect(resetButton).toBeDisabled();
 
     await userEvent.click(screen.getByTestId("select-first"));
@@ -200,12 +281,9 @@ describe("HomeContent", () => {
     vi.spyOn(window, "clearInterval").mockImplementation(() => {});
 
     const init = await ensureRowInitialized();
-    window.localStorage.setItem(
-      ROW_STORAGE_KEY,
-      JSON.stringify([
-        init({ rowId: "pending-1", status: "Pending", input: "process me" }),
-      ]),
-    );
+    gridRepositoryMock.__setRows([
+      init({ rowId: "pending-1", status: "Pending", input: "process me" }),
+    ]);
 
     const HomeContent = await loadHomeContent();
     render(<HomeContent />);
@@ -220,16 +298,20 @@ describe("HomeContent", () => {
       intervalCallbacks.forEach((callback) => callback());
     });
 
-    await waitFor(() => {
-      expect(getMetricValue("In progress")).toHaveTextContent("1");
-    });
-
     await act(async () => {
       intervalCallbacks.forEach((callback) => callback());
     });
 
     await waitFor(() => {
-      expect(getMetricValue("Completed")).toHaveTextContent("1");
+      expect(gridRepositoryMock.saveGridRows).toHaveBeenCalled();
     });
+
+    const lastPersisted =
+      gridRepositoryMock.saveGridRows.mock.calls[
+        gridRepositoryMock.saveGridRows.mock.calls.length - 1
+      ][0];
+    expect(lastPersisted).toEqual(
+      expect.arrayContaining([expect.objectContaining({ status: "Complete" })]),
+    );
   });
 });

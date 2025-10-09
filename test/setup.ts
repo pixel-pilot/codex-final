@@ -28,8 +28,6 @@ beforeAll(() => {
 
 beforeEach(() => {
   vi.useRealTimers();
-  localStorage.clear();
-  sessionStorage.clear();
 });
 
 afterEach(() => {

@@ -1,15 +1,18 @@
 "use client";
 
 import { create } from "zustand";
-import { persist, createJSONStorage } from "zustand/middleware";
 import {
   ListUpdatesParams,
   ListUpdatesResult,
   UpdateRecord,
   listUpdates,
 } from "../../lib/updatesRepository";
-
-const LOCAL_STORAGE_KEY = "reactive-ai-updates-cache-v1";
+import {
+  loadUpdatesState,
+  saveUpdatesState,
+  subscribeToUpdatesState,
+  type PersistedUpdatesState,
+} from "../../lib/updatesStateRepository";
 
 export type UpdatesFilterState = {
   category: UpdateRecord["category"] | "All";
@@ -26,6 +29,7 @@ export type UpdatesState = {
   nextCursor: string | null;
   filters: UpdatesFilterState;
   initialized: boolean;
+  persistedHydrated: boolean;
   initialize: () => Promise<void>;
   refresh: () => Promise<void>;
   loadMore: () => Promise<void>;
@@ -39,11 +43,6 @@ const initialFilters: UpdatesFilterState = {
   startDate: null,
   endDate: null,
 };
-
-type PersistedState = Pick<
-  UpdatesState,
-  "entries" | "nextCursor" | "filters" | "lastViewed"
->;
 
 const hydrateResult = ({ entries, nextCursor }: ListUpdatesResult) => ({
   entries,
@@ -61,15 +60,6 @@ const buildListParams = (
   endDate: filters.endDate ?? undefined,
   ...extras,
 });
-
-const noopStorage: Storage = {
-  length: 0,
-  clear: () => undefined,
-  getItem: () => null,
-  key: () => null,
-  removeItem: () => undefined,
-  setItem: () => undefined,
-};
 
 const isValidCursor = (value: string | null): boolean => {
   if (!value) {
@@ -90,124 +80,220 @@ const isValidCursor = (value: string | null): boolean => {
   }
 };
 
-export const useUpdatesStore = create<UpdatesState>()(
-  persist(
-    (set, get) => ({
-      entries: [],
-      lastViewed: null,
-      loading: false,
-      error: null,
-      nextCursor: null,
-      filters: initialFilters,
-      initialized: false,
-      initialize: async () => {
-        if (get().initialized || get().loading) {
-          return;
-        }
+const sanitizePersistedState = (
+  payload: PersistedUpdatesState | null,
+): PersistedUpdatesState | null => {
+  if (!payload) {
+    return null;
+  }
 
-        set({ loading: true, error: null });
+  const filters: UpdatesFilterState = {
+    ...initialFilters,
+    ...(payload.filters ?? initialFilters),
+  };
 
-        try {
-          const result = await listUpdates(buildListParams(get().filters));
+  return {
+    entries: Array.isArray(payload.entries) ? payload.entries : [],
+    nextCursor: isValidCursor(payload.nextCursor) ? payload.nextCursor : null,
+    filters,
+    lastViewed: typeof payload.lastViewed === "string" ? payload.lastViewed : null,
+  };
+};
 
-          set({
-            ...hydrateResult(result),
-            loading: false,
-            initialized: true,
-          });
-        } catch (error) {
-          set({
-            loading: false,
-            error: error instanceof Error ? error.message : String(error),
-          });
-        }
-      },
-      refresh: async () => {
-        if (get().loading) {
-          return;
-        }
+let lastPersistedSnapshot = "";
 
-        set({ loading: true, error: null });
+export const useUpdatesStore = create<UpdatesState>()((set, get) => {
+  const persistState = async () => {
+    if (!get().persistedHydrated) {
+      return;
+    }
 
-        try {
-          const result = await listUpdates(buildListParams(get().filters));
+    const payload: PersistedUpdatesState = {
+      entries: get().entries,
+      nextCursor: get().nextCursor,
+      filters: get().filters,
+      lastViewed: get().lastViewed,
+    };
 
-          set({
-            ...hydrateResult(result),
-            loading: false,
-            initialized: true,
-          });
-        } catch (error) {
-          set({
-            loading: false,
-            error: error instanceof Error ? error.message : String(error),
-          });
-        }
-      },
-      loadMore: async () => {
-        const { nextCursor, loading } = get();
-        if (!nextCursor || loading) {
-          return;
-        }
+    const serialized = JSON.stringify(payload);
+    if (serialized === lastPersistedSnapshot) {
+      return;
+    }
 
-        set({ loading: true, error: null });
+    lastPersistedSnapshot = serialized;
 
-        try {
-          const result = await listUpdates(
-            buildListParams(get().filters, { cursor: nextCursor })
-          );
+    try {
+      await saveUpdatesState(payload);
+    } catch (error) {
+      console.error("Unable to persist updates cache", error);
+    }
+  };
 
-          set({
-            entries: [...get().entries, ...result.entries],
-            nextCursor: result.nextCursor,
-            loading: false,
-          });
-        } catch (error) {
-          set({
-            loading: false,
-            error: error instanceof Error ? error.message : String(error),
-          });
-        }
-      },
-      setFilters: (filters) => {
-        const nextFilters = { ...get().filters, ...filters };
+  const hydrateFromPersisted = async () => {
+    if (get().persistedHydrated) {
+      return;
+    }
+
+    try {
+      const stored = sanitizePersistedState(await loadUpdatesState());
+      if (stored) {
+        lastPersistedSnapshot = JSON.stringify(stored);
+        set((state) => ({
+          ...state,
+          entries: stored.entries,
+          nextCursor: stored.nextCursor,
+          filters: stored.filters,
+          lastViewed: stored.lastViewed,
+          initialized: stored.entries.length > 0 ? true : state.initialized,
+        }));
+      }
+    } catch (error) {
+      console.error("Unable to hydrate updates cache", error);
+    } finally {
+      set({ persistedHydrated: true });
+    }
+  };
+
+  return {
+    entries: [],
+    lastViewed: null,
+    loading: false,
+    error: null,
+    nextCursor: null,
+    filters: initialFilters,
+    initialized: false,
+    persistedHydrated: false,
+    initialize: async () => {
+      if (get().loading) {
+        return;
+      }
+
+      await hydrateFromPersisted();
+
+      if (get().initialized) {
+        return;
+      }
+
+      set({ loading: true, error: null });
+
+      try {
+        const result = await listUpdates(buildListParams(get().filters));
 
         set({
-          filters: nextFilters,
-          initialized: false,
-          entries: [],
-          nextCursor: null,
+          ...hydrateResult(result),
+          loading: false,
+          initialized: true,
         });
 
-        void get().initialize();
-      },
-      markAllRead: () => {
-        const latest = get().entries[0]?.timestamp ?? null;
-        set({ lastViewed: latest });
-      },
-    }),
-    {
-      name: LOCAL_STORAGE_KEY,
-      storage: createJSONStorage(() =>
-        typeof window === "undefined" ? noopStorage : window.localStorage
-      ),
-      partialize: (state): PersistedState => ({
-        entries: state.entries,
-        nextCursor: state.nextCursor,
-        filters: state.filters,
-        lastViewed: state.lastViewed,
-      }),
-      onRehydrateStorage: () => (state) => {
-        if (!state) {
-          return;
-        }
+        void persistState();
+      } catch (error) {
+        set({
+          loading: false,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    },
+    refresh: async () => {
+      if (get().loading) {
+        return;
+      }
 
-        state.initialized = state.entries.length > 0;
+      await hydrateFromPersisted();
 
-        if (!isValidCursor(state.nextCursor)) {
-          state.nextCursor = null;
-        }
-      },
-    }
-  )
-);
+      set({ loading: true, error: null });
+
+      try {
+        const result = await listUpdates(buildListParams(get().filters));
+
+        set({
+          ...hydrateResult(result),
+          loading: false,
+          initialized: true,
+        });
+
+        void persistState();
+      } catch (error) {
+        set({
+          loading: false,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    },
+    loadMore: async () => {
+      const { nextCursor, loading } = get();
+      if (!nextCursor || loading) {
+        return;
+      }
+
+      set({ loading: true, error: null });
+
+      try {
+        const result = await listUpdates(
+          buildListParams(get().filters, { cursor: nextCursor })
+        );
+
+        set({
+          entries: [...get().entries, ...result.entries],
+          nextCursor: result.nextCursor,
+          loading: false,
+        });
+
+        void persistState();
+      } catch (error) {
+        set({
+          loading: false,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    },
+    setFilters: (filters) => {
+      const nextFilters = { ...get().filters, ...filters };
+
+      set({
+        filters: nextFilters,
+        initialized: false,
+        entries: [],
+        nextCursor: null,
+      });
+
+      void persistState();
+      void get().initialize();
+    },
+    markAllRead: () => {
+      const latest = get().entries[0]?.timestamp ?? null;
+      set({ lastViewed: latest });
+
+      void persistState();
+    },
+  };
+});
+
+if (typeof window !== "undefined") {
+  try {
+    subscribeToUpdatesState((payload) => {
+      const sanitized = sanitizePersistedState(payload);
+      if (!sanitized) {
+        return;
+      }
+
+      const serialized = JSON.stringify(sanitized);
+      if (serialized === lastPersistedSnapshot) {
+        return;
+      }
+
+      lastPersistedSnapshot = serialized;
+
+      useUpdatesStore.setState((state) => ({
+        ...state,
+        entries: sanitized.entries,
+        nextCursor: sanitized.nextCursor,
+        filters: sanitized.filters,
+        lastViewed: sanitized.lastViewed,
+        initialized: sanitized.entries.length > 0 ? true : state.initialized,
+        persistedHydrated: true,
+      }));
+    });
+  } catch (error) {
+    console.error("Unable to subscribe to updates cache", error);
+  }
+}

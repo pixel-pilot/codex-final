@@ -2,13 +2,91 @@ import React from "react";
 import { render, screen, within, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import SettingsPanel from "../SettingsPanel";
+import type {
+  PersistedModelCatalog,
+  PersistedSettingsState,
+} from "../../../lib/settingsRepository";
 
-const SETTINGS_STORAGE_KEY = "reactive-ai-settings-preferences";
-const MODEL_CATALOG_STORAGE_KEY = "reactive-ai-model-catalog";
+type SettingsRepositoryModule = typeof import("../../../lib/settingsRepository");
+
+function createSettingsRepositoryMock() {
+  let settingsState: PersistedSettingsState | null = null;
+  let catalogState: PersistedModelCatalog | null = null;
+  const settingsListeners = new Set<(payload: PersistedSettingsState | null) => void>();
+  const catalogListeners = new Set<(payload: PersistedModelCatalog | null) => void>();
+  const loadSettingsState = vi.fn(async () => settingsState);
+  const saveSettingsState = vi.fn(async (payload: PersistedSettingsState) => {
+    settingsState = payload;
+    settingsListeners.forEach((listener) => listener(payload));
+  });
+  const subscribeToSettingsState = vi.fn(
+    (handler: (payload: PersistedSettingsState | null) => void) => {
+      settingsListeners.add(handler);
+      return () => {
+        settingsListeners.delete(handler);
+      };
+    },
+  );
+  const loadModelCatalog = vi.fn(async () => catalogState);
+  const saveModelCatalog = vi.fn(async (payload: PersistedModelCatalog) => {
+    catalogState = payload;
+    catalogListeners.forEach((listener) => listener(payload));
+  });
+  const subscribeToModelCatalog = vi.fn(
+    (handler: (payload: PersistedModelCatalog | null) => void) => {
+      catalogListeners.add(handler);
+      return () => {
+        catalogListeners.delete(handler);
+      };
+    },
+  );
+
+  return {
+    loadSettingsState,
+    saveSettingsState,
+    subscribeToSettingsState,
+    loadModelCatalog,
+    saveModelCatalog,
+    subscribeToModelCatalog,
+    __setSettings(payload: PersistedSettingsState | null) {
+      settingsState = payload;
+    },
+    __setCatalog(payload: PersistedModelCatalog | null) {
+      catalogState = payload;
+    },
+    __getSettings: () => settingsState,
+    __getCatalog: () => catalogState,
+    __reset() {
+      settingsState = null;
+      catalogState = null;
+      settingsListeners.clear();
+      catalogListeners.clear();
+      loadSettingsState.mockReset();
+      saveSettingsState.mockReset();
+      subscribeToSettingsState.mockReset();
+      loadModelCatalog.mockReset();
+      saveModelCatalog.mockReset();
+      subscribeToModelCatalog.mockReset();
+    },
+  } satisfies Partial<SettingsRepositoryModule> & {
+    __setSettings: (payload: PersistedSettingsState | null) => void;
+    __setCatalog: (payload: PersistedModelCatalog | null) => void;
+    __getSettings: () => PersistedSettingsState | null;
+    __getCatalog: () => PersistedModelCatalog | null;
+    __reset: () => void;
+  };
+}
+
+const settingsRepositoryMock: ReturnType<typeof createSettingsRepositoryMock> =
+  vi.hoisted(
+    () => createSettingsRepositoryMock() as ReturnType<typeof createSettingsRepositoryMock>,
+  );
+
+vi.mock("../../../lib/settingsRepository", () => settingsRepositoryMock);
 
 describe("SettingsPanel", () => {
   beforeEach(() => {
-    window.localStorage.clear();
+    settingsRepositoryMock.__reset();
     vi.restoreAllMocks();
   });
 
@@ -16,7 +94,7 @@ describe("SettingsPanel", () => {
     const freshTimestamp = Date.now() - 60 * 60 * 1000;
     const staleTimestamp = Date.now() - 80 * 60 * 60 * 1000;
 
-    const settingsPayload = {
+    const settingsPayload: PersistedSettingsState = {
       apiKey: "sk-or-abcdefghijklmnop",
       selectedModelId: "gpt-awesome",
       webSearchEnabled: true,
@@ -26,6 +104,7 @@ describe("SettingsPanel", () => {
       topP: 0.9,
       topK: "50",
       reasoningLevel: "deep",
+      rateLimitPerMinute: 140,
       knownModelIds: ["gpt-awesome", ""],
       modelNotifications: [
         { id: "fresh", name: "Fresh Model", timestamp: freshTimestamp },
@@ -33,7 +112,7 @@ describe("SettingsPanel", () => {
       ],
     };
 
-    const catalogPayload = {
+    const catalogPayload: PersistedModelCatalog = {
       models: [
         { id: "gpt-awesome", name: "Awesome", pricing: { prompt: 0.001, completion: 0.002 } },
       ],
@@ -41,8 +120,8 @@ describe("SettingsPanel", () => {
       storedAt: Date.now(),
     };
 
-    window.localStorage.setItem(SETTINGS_STORAGE_KEY, JSON.stringify(settingsPayload));
-    window.localStorage.setItem(MODEL_CATALOG_STORAGE_KEY, JSON.stringify(catalogPayload));
+    settingsRepositoryMock.__setSettings(settingsPayload);
+    settingsRepositoryMock.__setCatalog(catalogPayload);
 
     render(<SettingsPanel />);
 
@@ -55,8 +134,11 @@ describe("SettingsPanel", () => {
     const topKInput = screen.getByLabelText("Top-K");
     expect((topKInput as HTMLInputElement).value).toBe("50");
 
-    const notifications = screen.getByRole("status");
-    const items = within(notifications).getAllByRole("listitem");
+    const toggle = screen.getByRole("button", { name: /recently added models/i });
+    const notificationsRegion = toggle.closest(".settings-notifications");
+    expect(notificationsRegion).not.toBeNull();
+    await userEvent.click(toggle);
+    const items = within(notificationsRegion as HTMLElement).getAllByRole("listitem");
     expect(items).toHaveLength(1);
     expect(within(items[0]).getByText("Fresh Model")).toBeInTheDocument();
 
@@ -66,11 +148,19 @@ describe("SettingsPanel", () => {
     expect((webSearchToggle as HTMLInputElement).checked).toBe(false);
 
     await waitFor(() => {
-      const stored = window.localStorage.getItem(SETTINGS_STORAGE_KEY);
-      expect(stored).toBeTruthy();
-      const parsed = stored ? JSON.parse(stored) : {};
-      expect(parsed.webSearchEnabled).toBe(false);
+      expect(settingsRepositoryMock.saveSettingsState).toHaveBeenCalled();
     });
+
+    const lastCallIndex =
+      settingsRepositoryMock.saveSettingsState.mock.calls.length - 1;
+    expect(lastCallIndex).toBeGreaterThanOrEqual(0);
+    const persisted =
+      settingsRepositoryMock.saveSettingsState.mock.calls[lastCallIndex][0];
+    expect(persisted.webSearchEnabled).toBe(false);
+    expect(persisted.modelNotifications).toEqual(
+      expect.arrayContaining([expect.objectContaining({ id: "fresh" })]),
+    );
+    expect(persisted.modelNotifications).toHaveLength(1);
   });
 
   it("fetches models, records notifications, and caches the catalog", async () => {
@@ -97,7 +187,7 @@ describe("SettingsPanel", () => {
 
     render(<SettingsPanel />);
 
-    const fetchButton = await screen.findByRole("button", { name: /refresh catalog/i });
+    const fetchButton = await screen.findByRole("button", { name: /refresh models/i });
     await userEvent.click(fetchButton);
 
     await waitFor(() => {
@@ -113,15 +203,20 @@ describe("SettingsPanel", () => {
     const option = await screen.findByRole("option", { name: /meta llama/i });
     expect(option).toBeInTheDocument();
 
-    const notifications = screen.getByRole("status");
-    expect(within(notifications).getAllByRole("listitem")).toHaveLength(1);
+    const notificationsToggle = screen.getByRole("button", { name: /recently added models/i });
+    const notificationsContainer = notificationsToggle.closest(".settings-notifications");
+    expect(notificationsContainer).not.toBeNull();
+    await userEvent.click(notificationsToggle);
+    expect(within(notificationsContainer as HTMLElement).getAllByRole("listitem")).toHaveLength(1);
 
     await waitFor(() => {
-      const stored = window.localStorage.getItem(MODEL_CATALOG_STORAGE_KEY);
-      expect(stored).toBeTruthy();
-      const parsed = stored ? JSON.parse(stored) : {};
-      expect(parsed.models?.[0]?.id).toBe("meta/llama");
+      expect(settingsRepositoryMock.saveModelCatalog).toHaveBeenCalled();
     });
+
+    const lastCallIndex = settingsRepositoryMock.saveModelCatalog.mock.calls.length - 1;
+    expect(lastCallIndex).toBeGreaterThanOrEqual(0);
+    const persistedCatalog = settingsRepositoryMock.saveModelCatalog.mock.calls[lastCallIndex][0];
+    expect(persistedCatalog.models?.[0]?.id).toBe("meta/llama");
   });
 
   it("validates API keys and reports failures", async () => {
