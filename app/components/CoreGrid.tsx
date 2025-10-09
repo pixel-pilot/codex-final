@@ -525,13 +525,11 @@ const CoreGrid = forwardRef<CoreGridHandle>(function CoreGridComponent(_, ref) {
     setActiveRow(rowIndex);
   }, []);
 
-  const handlePasteAtRow = useCallback(
-    (event: ClipboardEvent<HTMLTextAreaElement>, rowIndex: number) => {
-      event.preventDefault();
-      const clipboardText = event.clipboardData?.getData("text") ?? "";
+  const applyClipboardText = useCallback(
+    (rowIndex: number, clipboardText: string): boolean => {
       const values = parseClipboardText(clipboardText);
       if (!values.length) {
-        return;
+        return false;
       }
 
       updateRowRange(rowIndex, values);
@@ -540,12 +538,26 @@ const CoreGrid = forwardRef<CoreGridHandle>(function CoreGridComponent(_, ref) {
         setEditingRow(null);
       }
 
+      return true;
+    },
+    [updateRowRange],
+  );
+
+  const handlePasteAtRow = useCallback(
+    (event: ClipboardEvent<HTMLTextAreaElement>, rowIndex: number) => {
+      event.preventDefault();
+      const clipboardText = event.clipboardData?.getData("text") ?? "";
+      const applied = applyClipboardText(rowIndex, clipboardText);
+      if (!applied) {
+        return;
+      }
+
       const clipboard = clipboardRef.current;
       if (clipboard) {
         clipboard.value = "";
       }
     },
-    [updateRowRange],
+    [applyClipboardText],
   );
 
   const handleClipboardPaste = useCallback(
@@ -553,6 +565,32 @@ const CoreGrid = forwardRef<CoreGridHandle>(function CoreGridComponent(_, ref) {
       handlePasteAtRow(event, activeRow);
     },
     [activeRow, handlePasteAtRow],
+  );
+
+  const pasteFromClipboardAPI = useCallback(
+    async (rowIndex: number) => {
+      if (typeof navigator === "undefined" || !navigator.clipboard?.readText) {
+        return;
+      }
+
+      try {
+        const text = await navigator.clipboard.readText();
+        if (!text) {
+          return;
+        }
+
+        const applied = applyClipboardText(rowIndex, text);
+        if (applied) {
+          const clipboard = clipboardRef.current;
+          if (clipboard) {
+            clipboard.value = "";
+          }
+        }
+      } catch (error) {
+        console.warn("Failed to read clipboard text via navigator.clipboard", error);
+      }
+    },
+    [applyClipboardText],
   );
 
   const handleRowMouseDown = useCallback(
@@ -584,6 +622,13 @@ const CoreGrid = forwardRef<CoreGridHandle>(function CoreGridComponent(_, ref) {
 
   const handleClipboardKeyDown = useCallback(
     (event: KeyboardEvent<HTMLTextAreaElement>) => {
+      if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "v") {
+        if (event.shiftKey) {
+          void pasteFromClipboardAPI(activeRow);
+        }
+        return;
+      }
+
       if (event.key === "ArrowDown") {
         event.preventDefault();
         let appended = false;
@@ -617,6 +662,11 @@ const CoreGrid = forwardRef<CoreGridHandle>(function CoreGridComponent(_, ref) {
 
   const handleEditingKeyDown = useCallback(
     (event: KeyboardEvent<HTMLTextAreaElement>, rowIndex: number) => {
+      if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "v" && event.shiftKey) {
+        void pasteFromClipboardAPI(rowIndex);
+        return;
+      }
+
       if (event.key === "Enter" && !event.shiftKey) {
         event.preventDefault();
         let appended = false;
@@ -641,7 +691,7 @@ const CoreGrid = forwardRef<CoreGridHandle>(function CoreGridComponent(_, ref) {
         focusClipboardInput();
       }
     },
-    [focusClipboardInput],
+    [focusClipboardInput, pasteFromClipboardAPI],
   );
 
   useEffect(() => {
