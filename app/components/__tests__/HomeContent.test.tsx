@@ -2,6 +2,7 @@ import React from "react";
 import { render, screen, within, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { act } from "react";
+import { useUpdatesStore } from "../../stores/updatesStore";
 
 const writeTextToClipboardMock = vi.fn(async (_text: string) => true);
 
@@ -66,6 +67,7 @@ vi.mock("../CoreGrid", async () => {
 });
 
 type GridRepositoryModule = typeof import("../../../lib/gridRepository");
+type SystemRepositoryModule = typeof import("../../../lib/systemRepository");
 
 const createGridRepositoryMock = () => {
   let rows: Array<any> = [];
@@ -133,6 +135,57 @@ const gridRepositoryMock = createGridRepositoryMock();
 
 vi.mock("../../../lib/gridRepository", () => gridRepositoryMock);
 
+const createSystemRepositoryMock = () => {
+  let state: any = null;
+  const listeners = new Set<(payload: any) => void>();
+  const loadSystemState = vi.fn<ReturnType<SystemRepositoryModule["loadSystemState"]>, Parameters<SystemRepositoryModule["loadSystemState"]>>();
+  const saveSystemState = vi.fn<ReturnType<SystemRepositoryModule["saveSystemState"]>, Parameters<SystemRepositoryModule["saveSystemState"]>>();
+  const subscribeToSystemState = vi.fn<
+    ReturnType<SystemRepositoryModule["subscribeToSystemState"]>,
+    Parameters<SystemRepositoryModule["subscribeToSystemState"]>
+  >();
+
+  const applyDefaultImplementation = () => {
+    loadSystemState.mockImplementation(async () => state);
+    saveSystemState.mockImplementation(async (payload: any) => {
+      state = payload;
+      listeners.forEach((listener) => listener(payload));
+    });
+    subscribeToSystemState.mockImplementation((handler: (payload: any) => void) => {
+      listeners.add(handler);
+      return () => {
+        listeners.delete(handler);
+      };
+    });
+  };
+
+  applyDefaultImplementation();
+
+  return {
+    loadSystemState,
+    saveSystemState,
+    subscribeToSystemState,
+    __setState(next: any) {
+      state = next;
+    },
+    __reset() {
+      state = null;
+      listeners.clear();
+      loadSystemState.mockReset();
+      saveSystemState.mockReset();
+      subscribeToSystemState.mockReset();
+      applyDefaultImplementation();
+    },
+  } satisfies Partial<SystemRepositoryModule> & {
+    __setState: (next: any) => void;
+    __reset: () => void;
+  };
+};
+
+const systemRepositoryMock = createSystemRepositoryMock();
+
+vi.mock("../../../lib/systemRepository", () => systemRepositoryMock);
+
 vi.mock("../UpdatesPanel", () => ({
   __esModule: true,
   default: () => <div data-testid="updates-panel-mock" />,
@@ -182,6 +235,7 @@ const getMetricValue = (label: string) => {
 describe("HomeContent", () => {
   beforeEach(() => {
     gridRepositoryMock.__reset();
+    systemRepositoryMock.__reset();
     settingsState = null;
     settingsListeners.clear();
     vi.restoreAllMocks();
@@ -331,6 +385,12 @@ describe("HomeContent", () => {
     await userEvent.click(toggle);
     expect(toggle).toHaveAttribute("aria-pressed", "true");
 
+    await waitFor(() => {
+      expect(systemRepositoryMock.saveSystemState).toHaveBeenCalledWith(
+        expect.objectContaining({ active: true }),
+      );
+    });
+
     expect(intervalCallbacks).not.toHaveLength(0);
 
     await act(async () => {
@@ -347,8 +407,8 @@ describe("HomeContent", () => {
 
     const lastPersisted =
       gridRepositoryMock.saveGridRows.mock.calls[
-        gridRepositoryMock.saveGridRows.mock.calls.length - 1
-      ][0];
+      gridRepositoryMock.saveGridRows.mock.calls.length - 1
+    ][0];
     expect(lastPersisted).toEqual(
       expect.arrayContaining([expect.objectContaining({ status: "Complete" })]),
     );
