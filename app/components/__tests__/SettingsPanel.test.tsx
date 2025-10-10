@@ -455,4 +455,62 @@ describe("SettingsPanel persistence fallback", () => {
 
     secondRender.unmount();
   });
+
+  it("persists settings locally when Supabase operations fail", async () => {
+    const supabaseClient = {
+      from: vi.fn(() => ({
+        select: () => ({
+          eq: () => ({
+            maybeSingle: async () => {
+              throw new Error("select failed");
+            },
+          }),
+        }),
+        upsert: async () => {
+          throw new Error("upsert failed");
+        },
+      })),
+      channel: vi.fn(() => {
+        throw new Error("channel failed");
+      }),
+      removeChannel: vi.fn(),
+    };
+
+    vi.doMock(SUPABASE_CLIENT_PATH, () => ({
+      getSupabaseClient: () => supabaseClient,
+    }));
+
+    const SettingsPanel = await importSettingsPanel();
+
+    const { unmount } = render(<SettingsPanel />);
+
+    const apiKeyInput = await screen.findByLabelText("API Key");
+    await userEvent.clear(apiKeyInput);
+    await userEvent.type(apiKeyInput, "sk-or-rejecting12345");
+
+    const webSearchToggle = screen.getByLabelText(
+      "Enable OpenRouter web search augmentation",
+    );
+    expect((webSearchToggle as HTMLInputElement).checked).toBe(false);
+    await userEvent.click(webSearchToggle);
+
+    await waitFor(() => {
+      const stored = window.localStorage.getItem("app_state:settings_preferences");
+      expect(stored).toContain("sk-or-rejecting12345");
+    });
+
+    unmount();
+
+    const rerender = render(<SettingsPanel />);
+
+    const persistedApiKey = await screen.findByLabelText("API Key");
+    expect((persistedApiKey as HTMLInputElement).value).toBe("sk-or-rejecting12345");
+
+    const persistedWebToggle = screen.getByLabelText(
+      "Enable OpenRouter web search augmentation",
+    );
+    expect((persistedWebToggle as HTMLInputElement).checked).toBe(true);
+
+    rerender.unmount();
+  });
 });

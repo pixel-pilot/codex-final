@@ -27,6 +27,10 @@ type LocalBroadcastMessage<T> = {
 
 let cachedSupabaseClient: SupabaseClient | null | undefined;
 
+const clearCachedSupabaseClient = () => {
+  cachedSupabaseClient = undefined;
+};
+
 const getSupabaseClientOrNull = (): SupabaseClient | null => {
   if (cachedSupabaseClient !== undefined) {
     return cachedSupabaseClient;
@@ -34,7 +38,7 @@ const getSupabaseClientOrNull = (): SupabaseClient | null => {
 
   try {
     if (typeof getSupabaseClient !== "function") {
-      cachedSupabaseClient = null;
+      clearCachedSupabaseClient();
       return null;
     }
 
@@ -43,7 +47,7 @@ const getSupabaseClientOrNull = (): SupabaseClient | null => {
     return cachedSupabaseClient;
   } catch (error) {
     console.warn("Falling back to local persistence: Supabase client unavailable.", error);
-    cachedSupabaseClient = null;
+    clearCachedSupabaseClient();
     return null;
   }
 };
@@ -176,19 +180,28 @@ export const loadState = async <T>(key: string): Promise<T | null> => {
     return readFromLocalStorage<T>(key);
   }
 
-  const { data, error } = await client
-    .from(TABLE_NAME)
-    .select("payload")
-    .eq("key", key)
-    .maybeSingle();
+  try {
+    const { data, error } = await client
+      .from(TABLE_NAME)
+      .select("payload")
+      .eq("key", key)
+      .maybeSingle();
 
-  if (error) {
-    throw error;
+    if (error) {
+      throw error;
+    }
+
+    const record = data as AppStateRow<T> | null;
+
+    return record?.payload ?? null;
+  } catch (error) {
+    console.warn(
+      `Supabase read for key "${key}" failed; falling back to local storage.`,
+      error,
+    );
+    clearCachedSupabaseClient();
+    return readFromLocalStorage<T>(key);
   }
-
-  const record = data as AppStateRow<T> | null;
-
-  return record?.payload ?? null;
 };
 
 export const saveState = async <T>(key: string, payload: T): Promise<void> => {
@@ -199,15 +212,24 @@ export const saveState = async <T>(key: string, payload: T): Promise<void> => {
     return;
   }
 
-  const { error } = await client.from(TABLE_NAME).upsert(
-    { key, payload } satisfies AppStateRow<T>,
-    {
-      onConflict: "key",
-    },
-  );
+  try {
+    const { error } = await client.from(TABLE_NAME).upsert(
+      { key, payload } satisfies AppStateRow<T>,
+      {
+        onConflict: "key",
+      },
+    );
 
-  if (error) {
-    throw error;
+    if (error) {
+      throw error;
+    }
+  } catch (error) {
+    console.warn(
+      `Supabase write for key "${key}" failed; using local storage instead.`,
+      error,
+    );
+    clearCachedSupabaseClient();
+    writeToLocalStorage(key, payload);
   }
 };
 
@@ -215,13 +237,15 @@ export const subscribeToState = <T>(
   key: string,
   handler: (payload: T | null) => void,
 ): (() => void) => {
+  const fallbackSubscribe = () => subscribeToLocalState(key, handler);
   const client = getSupabaseClientOrNull();
 
   if (!client) {
-    return subscribeToLocalState(key, handler);
+    return fallbackSubscribe();
   }
 
   let channel: RealtimeChannel | null = null;
+  let fallbackCleanup: (() => void) | null = null;
 
   try {
     channel = client
@@ -243,13 +267,35 @@ export const subscribeToState = <T>(
           const record = payload.new as AppStateRow<T> | null;
           handler(record?.payload ?? null);
         },
-      )
-      .subscribe();
+      );
+
+    const subscribeResult = channel.subscribe();
+
+    if (subscribeResult instanceof Promise) {
+      subscribeResult.catch((error) => {
+        console.warn(
+          `Supabase subscription for key "${key}" failed; reverting to local subscriptions.`,
+          error,
+        );
+        clearCachedSupabaseClient();
+        void client.removeChannel(channel as RealtimeChannel);
+        if (!fallbackCleanup) {
+          fallbackCleanup = fallbackSubscribe();
+        }
+      });
+    }
   } catch (error) {
-    console.error(`Unable to subscribe to state key "${key}"`, error);
+    console.warn(
+      `Supabase subscription for key "${key}" failed; reverting to local subscriptions.`,
+      error,
+    );
+    clearCachedSupabaseClient();
+    return fallbackSubscribe();
   }
 
   return () => {
+    fallbackCleanup?.();
+    fallbackCleanup = null;
     if (channel) {
       void client.removeChannel(channel);
     }
