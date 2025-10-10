@@ -3,6 +3,19 @@ import { render, screen, within, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { act } from "react";
 
+const writeTextToClipboardMock = vi.fn(async (_text: string) => true);
+
+vi.mock("../../../lib/clipboard", async () => {
+  const actual = await vi.importActual<typeof import("../../../lib/clipboard")>(
+    "../../../lib/clipboard",
+  );
+
+  return {
+    ...actual,
+    writeTextToClipboard: writeTextToClipboardMock,
+  };
+});
+
 vi.mock("../CoreGrid", async () => {
   const actual = await vi.importActual<typeof import("../CoreGrid")>("../CoreGrid");
 
@@ -188,6 +201,7 @@ describe("HomeContent", () => {
         },
       ),
     );
+    writeTextToClipboardMock.mockClear();
   });
 
   it("hydrates saved rows, updates metrics, and persists changes", async () => {
@@ -268,6 +282,31 @@ describe("HomeContent", () => {
 
     await userEvent.click(screen.getByTestId("select-all"));
     expect(screen.getByText(/selected/)).toHaveTextContent("2");
+  });
+
+  it("copies selected inputs and outputs via action shortcuts", async () => {
+    const init = await ensureRowInitialized();
+    gridRepositoryMock.__setRows([
+      init({ rowId: "row-1", status: "Pending", input: "alpha", output: "" }),
+      init({ rowId: "row-2", status: "Complete", input: "beta", output: "gamma" }),
+    ]);
+
+    const HomeContent = await loadHomeContent();
+    render(<HomeContent />);
+
+    await screen.findByTestId("core-grid-mock");
+
+    const selectAll = screen.getByTestId("select-all");
+    await userEvent.click(selectAll);
+
+    const copyInputsButton = screen.getByRole("button", { name: /copy all inputs/i });
+    await userEvent.click(copyInputsButton);
+    expect(writeTextToClipboardMock).toHaveBeenCalledWith("alpha\nbeta");
+
+    writeTextToClipboardMock.mockClear();
+    const copyOutputsButton = screen.getByRole("button", { name: /copy all outputs/i });
+    await userEvent.click(copyOutputsButton);
+    expect(writeTextToClipboardMock).toHaveBeenCalledWith("\ngamma");
   });
 
   it("advances generation state when the system toggle is enabled", async () => {
