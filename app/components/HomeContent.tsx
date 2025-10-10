@@ -24,7 +24,25 @@ import {
   subscribeToErrorLog,
   subscribeToGridRows,
 } from "../../lib/gridRepository";
-import { loadSettingsState, subscribeToSettingsState } from "../../lib/settingsRepository";
+import {
+  loadUsageLog,
+  saveUsageLog,
+  StoredUsageLogEntry,
+  subscribeToUsageLog,
+} from "../../lib/usageLogRepository";
+import {
+  loadModelCatalog,
+  loadSettingsState,
+  PersistedSettingsState,
+  PersistedModelCatalog,
+  subscribeToModelCatalog,
+  subscribeToSettingsState,
+} from "../../lib/settingsRepository";
+import {
+  loadSystemState,
+  saveSystemState,
+  type PersistedSystemState,
+} from "../../lib/systemRepository";
 import { writeTextToClipboard } from "../../lib/clipboard";
 
 type TabId = "generate" | "settings" | "usage" | "updates";
@@ -110,6 +128,72 @@ const computeCost = (inputTokens: number, outputTokens: number) => {
   const unitCost = 0.000002;
 
   return Number((totalTokens * unitCost).toFixed(4));
+};
+
+const normalizeUsageLogEntries = (entries: UsageEntry[] | null | undefined): UsageEntry[] => {
+  if (!Array.isArray(entries)) {
+    return [];
+  }
+
+  const unique = new Map<string, UsageEntry>();
+
+  entries.forEach((entry) => {
+    if (!entry) {
+      return;
+    }
+
+    const id = entry.id.trim();
+    if (!id) {
+      return;
+    }
+
+    const nextTimestamp = Date.parse(entry.timestamp);
+    const existing = unique.get(id);
+
+    if (!existing) {
+      unique.set(id, entry);
+      return;
+    }
+
+    const existingTimestamp = Date.parse(existing.timestamp);
+    const isExistingNaN = Number.isNaN(existingTimestamp);
+    const isNextNaN = Number.isNaN(nextTimestamp);
+
+    if (isExistingNaN && !isNextNaN) {
+      unique.set(id, entry);
+      return;
+    }
+
+    if (!isExistingNaN && !isNextNaN && nextTimestamp > existingTimestamp) {
+      unique.set(id, entry);
+      return;
+    }
+
+    if (isExistingNaN && isNextNaN) {
+      unique.set(id, entry);
+    }
+  });
+
+  return Array.from(unique.values())
+    .sort((a, b) => {
+      const aTime = Date.parse(a.timestamp);
+      const bTime = Date.parse(b.timestamp);
+
+      if (Number.isNaN(aTime) && Number.isNaN(bTime)) {
+        return 0;
+      }
+
+      if (Number.isNaN(aTime)) {
+        return 1;
+      }
+
+      if (Number.isNaN(bTime)) {
+        return -1;
+      }
+
+      return bTime - aTime;
+    })
+    .slice(0, MAX_USAGE_LOG_ENTRIES);
 };
 
 const clampRateLimit = (value: number | "" | null | undefined): number => {
@@ -298,10 +382,91 @@ export default function HomeContent() {
     error: null,
   });
   const [actionAnnouncement, setActionAnnouncement] = useState("");
+  const updatesLoading = useUpdatesStore((state) => state.loading);
+  const updatesError = useUpdatesStore((state) => state.error);
   const lastPersistedRows = useRef<string | null>(null);
   const lastPersistedWidths = useRef<string | null>(null);
   const lastPersistedErrorLog = useRef<string | null>(null);
+  const lastPersistedUsageLog = useRef<string | null>(null);
+  const systemSyncRequestIdRef = useRef(0);
+  const confirmedSystemStateRef = useRef(false);
+  const failedSystemTargetRef = useRef<boolean | null>(null);
+  const hasAppliedInitialSystemStateRef = useRef(false);
+  const modelLabelsRef = useRef<Record<string, string>>({});
+  const settingsPayloadRef = useRef<PersistedSettingsState | null>(null);
   const actionAnnouncementTimeoutRef = useRef<number | null>(null);
+
+  const commitSystemState = useCallback(
+    (payload: PersistedSystemState) => {
+      confirmedSystemStateRef.current = payload.active;
+      failedSystemTargetRef.current = null;
+      hasAppliedInitialSystemStateRef.current = true;
+      setSystemActive(payload.active);
+      setSystemHydrated(true);
+      setSystemSyncState("idle");
+      setSystemSyncMessage(null);
+    },
+    [],
+  );
+
+  const updateSettingsSnapshot = useCallback(
+    (payload: PersistedSettingsState | null) => {
+      settingsPayloadRef.current = payload;
+
+      const trimmedModelId =
+        typeof payload?.selectedModelId === "string"
+          ? payload.selectedModelId.trim()
+          : "";
+      const modelId = trimmedModelId || DEFAULT_MODEL_ID;
+      const modelLabel = modelLabelsRef.current[modelId] ?? modelId;
+      const nextRateLimit = clampRateLimit(payload?.rateLimitPerMinute);
+
+      const nextSnapshot: SettingsSnapshot = {
+        modelId,
+        modelLabel,
+        webSearchEnabled: Boolean(payload?.webSearchEnabled),
+        maxTokens: sanitizeNumericPreference(payload?.maxTokens),
+        temperature: sanitizeNumericPreference(payload?.temperature),
+        repetitionPenalty: sanitizeNumericPreference(payload?.repetitionPenalty),
+        topP: sanitizeNumericPreference(payload?.topP),
+        topK: sanitizeNumericPreference(payload?.topK),
+        reasoningLevel:
+          payload?.reasoningLevel === "standard" || payload?.reasoningLevel === "deep"
+            ? payload.reasoningLevel
+            : "off",
+        rateLimitPerMinute: nextRateLimit,
+      };
+
+      setRateLimitPerMinute((previous) => {
+        return previous === nextRateLimit ? previous : nextRateLimit;
+      });
+
+      setSettingsSnapshot((previous) => {
+        if (
+          previous.modelId === nextSnapshot.modelId &&
+          previous.modelLabel === nextSnapshot.modelLabel &&
+          previous.webSearchEnabled === nextSnapshot.webSearchEnabled &&
+          previous.maxTokens === nextSnapshot.maxTokens &&
+          previous.temperature === nextSnapshot.temperature &&
+          previous.repetitionPenalty === nextSnapshot.repetitionPenalty &&
+          previous.topP === nextSnapshot.topP &&
+          previous.topK === nextSnapshot.topK &&
+          previous.reasoningLevel === nextSnapshot.reasoningLevel &&
+          previous.rateLimitPerMinute === nextSnapshot.rateLimitPerMinute
+        ) {
+          return previous;
+        }
+
+        return nextSnapshot;
+      });
+    },
+    [],
+  );
+
+  const updatesRefresh = useCallback(async () => {
+    const { refresh } = useUpdatesStore.getState();
+    await refresh();
+  }, []);
 
   const announceAction = useCallback((message: string) => {
     if (actionAnnouncementTimeoutRef.current !== null) {
@@ -364,7 +529,9 @@ export default function HomeContent() {
 
     return () => {
       cancelled = true;
-      unsubscribe();
+      if (typeof unsubscribe === "function") {
+        unsubscribe();
+      }
     };
   }, []);
 
@@ -483,7 +650,9 @@ export default function HomeContent() {
 
     return () => {
       cancelled = true;
-      unsubscribe();
+      if (typeof unsubscribe === "function") {
+        unsubscribe();
+      }
     };
   }, []);
 
@@ -525,7 +694,9 @@ export default function HomeContent() {
 
     return () => {
       cancelled = true;
-      unsubscribe();
+      if (typeof unsubscribe === "function") {
+        unsubscribe();
+      }
     };
   }, []);
 
@@ -570,6 +741,55 @@ export default function HomeContent() {
     return () => {
       cancelled = true;
       unsubscribe();
+    };
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    const hydrateUsageLog = async () => {
+      try {
+        const stored = await loadUsageLog();
+        if (cancelled) {
+          return;
+        }
+
+        const normalized = normalizeUsageLogEntries(stored);
+        setUsageLog(normalized);
+        lastPersistedUsageLog.current = JSON.stringify(normalized);
+      } catch (error) {
+        console.error("Unable to restore usage log", error);
+      } finally {
+        if (!cancelled) {
+          setUsageLogHydrated(true);
+        }
+      }
+    };
+
+    void hydrateUsageLog();
+
+    const unsubscribe = subscribeToUsageLog((stored) => {
+      if (cancelled) {
+        return;
+      }
+
+      const normalized = normalizeUsageLogEntries(stored);
+      const serialized = JSON.stringify(normalized);
+      if (lastPersistedUsageLog.current === serialized) {
+        setUsageLogHydrated(true);
+        return;
+      }
+
+      lastPersistedUsageLog.current = serialized;
+      setUsageLog(normalized);
+      setUsageLogHydrated(true);
+    });
+
+    const cleanup = typeof unsubscribe === "function" ? unsubscribe : () => {};
+
+    return () => {
+      cancelled = true;
+      cleanup();
     };
   }, []);
 
