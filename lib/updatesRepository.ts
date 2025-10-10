@@ -1,6 +1,7 @@
 "use client";
 
 import { getSupabaseClient } from "./supabaseClient";
+import { bundledUpdates } from "./staticUpdates";
 
 export type UpdateRecord = {
   id: string;
@@ -128,8 +129,91 @@ const requireSupabaseClient = () => {
   return getSupabaseClient();
 };
 
-export const listUpdates = async (
-  params: ListUpdatesParams = {}
+const isEntryAfterCursor = (entry: UpdateRecord, cursor: CursorPayload) =>
+  entry.timestamp < cursor.timestamp ||
+  (entry.timestamp === cursor.timestamp && entry.id < cursor.id);
+
+const compareEntriesDesc = (left: UpdateRecord, right: UpdateRecord) => {
+  if (left.timestamp !== right.timestamp) {
+    return left.timestamp > right.timestamp ? -1 : 1;
+  }
+
+  if (left.id === right.id) {
+    return 0;
+  }
+
+  return left.id > right.id ? -1 : 1;
+};
+
+const matchesCategory = (
+  entry: UpdateRecord,
+  category: ListUpdatesParams["category"],
+) => !category || category === "All" || entry.category === category;
+
+const matchesDateRange = (
+  entry: UpdateRecord,
+  startDate?: string,
+  endDate?: string,
+) => {
+  const timestamp = entry.timestamp;
+
+  if (startDate && timestamp < startDate) {
+    return false;
+  }
+
+  if (endDate && timestamp > endDate) {
+    return false;
+  }
+
+  return true;
+};
+
+const matchesSearch = (entry: UpdateRecord, search?: string) => {
+  if (!search) {
+    return true;
+  }
+
+  const term = search.trim().toLowerCase();
+
+  if (!term) {
+    return true;
+  }
+
+  return (
+    entry.title.toLowerCase().includes(term) ||
+    entry.description.toLowerCase().includes(term)
+  );
+};
+
+const listUpdatesFromStatic = (params: ListUpdatesParams): ListUpdatesResult => {
+  const filtered = bundledUpdates
+    .filter((entry) =>
+      matchesCategory(entry, params.category) &&
+      matchesDateRange(entry, params.startDate, params.endDate) &&
+      matchesSearch(entry, params.search),
+    )
+    .sort(compareEntriesDesc);
+
+  const cursor = parseCursor(params.cursor);
+
+  const afterCursor = cursor
+    ? filtered.filter((entry) => isEntryAfterCursor(entry, cursor))
+    : filtered;
+
+  const limit = params.limit ?? afterCursor.length;
+  const limited = afterCursor.slice(0, limit);
+
+  const hasMore = limited.length > 0 && afterCursor.length > limited.length;
+  const nextCursor = hasMore ? serializeCursor(limited[limited.length - 1]) : null;
+
+  return {
+    entries: limited,
+    nextCursor,
+  };
+};
+
+const listUpdatesFromSupabase = async (
+  params: ListUpdatesParams,
 ): Promise<ListUpdatesResult> => {
   const client = requireSupabaseClient();
 
@@ -151,6 +235,26 @@ export const listUpdates = async (
       : null;
 
   return { entries, nextCursor };
+};
+
+export const listUpdates = async (
+  params: ListUpdatesParams = {},
+): Promise<ListUpdatesResult> => {
+  try {
+    const result = await listUpdatesFromSupabase(params);
+
+    if (!params.cursor && result.entries.length === 0) {
+      console.info(
+        "Supabase returned no changelog entries. Falling back to bundled dataset.",
+      );
+      return listUpdatesFromStatic(params);
+    }
+
+    return result;
+  } catch (error) {
+    console.info("Falling back to bundled changelog entries.", error);
+    return listUpdatesFromStatic(params);
+  }
 };
 
 export const upsertUpdate = async (entry: UpdateRecord): Promise<void> => {
