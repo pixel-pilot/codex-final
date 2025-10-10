@@ -11,6 +11,7 @@ import CoreGrid, {
 } from "./CoreGrid";
 import SettingsPanel from "./SettingsPanel";
 import UpdatesPanel from "./UpdatesPanel";
+import { useUpdatesStore } from "../stores/updatesStore";
 import {
   loadGridRows,
   loadColumnWidths,
@@ -23,22 +24,17 @@ import {
   subscribeToErrorLog,
   subscribeToGridRows,
 } from "../../lib/gridRepository";
-import {
-  loadSettingsState,
-  subscribeToSettingsState,
-  loadModelCatalog,
-  subscribeToModelCatalog,
-  type PersistedSettingsState,
-  type PersistedModelCatalog,
-} from "../../lib/settingsRepository";
-import {
-  loadUsageLog,
-  saveUsageLog,
-  StoredUsageLogEntry,
-  subscribeToUsageLog,
-} from "../../lib/usageLogRepository";
+import { loadSettingsState, subscribeToSettingsState } from "../../lib/settingsRepository";
+import { writeTextToClipboard } from "../../lib/clipboard";
 
 type TabId = "generate" | "settings" | "usage" | "updates";
+
+type TabStatus = "idle" | "updating" | "error";
+type SystemSyncState = "idle" | "syncing" | "error";
+type TabRefreshStatus = {
+  status: "idle" | "refreshing" | "error";
+  message: string | null;
+};
 
 const TABS: { id: TabId; label: string }[] = [
   { id: "generate", label: "Generate" },
@@ -63,6 +59,8 @@ const MAX_ERROR_LOG_ENTRIES = 80;
 const MAX_USAGE_LOG_ENTRIES = 500;
 const QA_REPORT_ENDPOINT = "/qa/latest.json";
 const QA_REFRESH_INTERVAL_MS = 5 * 60 * 1000;
+const SYSTEM_SYNC_ERROR_MESSAGE = "Unable to sync changes. Please try again.";
+const SETTINGS_REFRESH_INFO_MESSAGE = "Settings update instantly; no manual refresh required.";
 
 const DEFAULT_MODEL_ID = "gpt-4-turbo";
 
@@ -179,27 +177,30 @@ const parseNumericFilter = (value: string): number | null => {
   return numeric;
 };
 
-const sortUsageEntries = (entries: UsageEntry[]): UsageEntry[] => {
-  return [...entries].sort((a, b) => {
-    const right = Date.parse(b.timestamp);
-    const left = Date.parse(a.timestamp);
+const formatReadableList = (items: string[]): string => {
+  if (items.length === 0) {
+    return "";
+  }
 
-    if (Number.isNaN(right) && Number.isNaN(left)) {
-      return 0;
-    }
-    if (Number.isNaN(right)) {
-      return 1;
-    }
-    if (Number.isNaN(left)) {
-      return -1;
-    }
+  if (items.length === 1) {
+    return items[0];
+  }
 
-    return right - left;
-  });
+  if (items.length === 2) {
+    return `${items[0]} and ${items[1]}`;
+  }
+
+  const initial = items.slice(0, -1).join(", ");
+  const last = items[items.length - 1];
+  return `${initial}, and ${last}`;
 };
 
-const normalizeUsageLogEntries = (entries: UsageEntry[]): UsageEntry[] => {
-  return sortUsageEntries(entries).slice(0, MAX_USAGE_LOG_ENTRIES);
+const buildRefreshErrorMessage = (resources: string[]): string => {
+  if (!resources.length) {
+    return "Unable to refresh the tab. Please try again.";
+  }
+
+  return `Unable to refresh ${formatReadableList(resources)}. Please try again.`;
 };
 
 const seedRows = (): GridRow[] => {
@@ -247,7 +248,17 @@ const seedRows = (): GridRow[] => {
 
 export default function HomeContent() {
   const [activeTab, setActiveTab] = useState<TabId>("generate");
+  const [mountedTabs, setMountedTabs] = useState<Set<TabId>>(() => new Set(["generate"]));
+  const [tabRefreshState, setTabRefreshState] = useState<Record<TabId, TabRefreshStatus>>(() => ({
+    generate: { status: "idle", message: null },
+    settings: { status: "idle", message: null },
+    usage: { status: "idle", message: null },
+    updates: { status: "idle", message: null },
+  }));
   const [systemActive, setSystemActive] = useState(false);
+  const [systemHydrated, setSystemHydrated] = useState(false);
+  const [systemSyncState, setSystemSyncState] = useState<SystemSyncState>("idle");
+  const [systemSyncMessage, setSystemSyncMessage] = useState<string | null>(null);
   const [rows, setRows] = useState<GridRow[]>(() => seedRows());
   const [rowsHydrated, setRowsHydrated] = useState(false);
   const [columnWidths, setColumnWidths] = useState<ColumnWidths>({
@@ -286,54 +297,35 @@ export default function HomeContent() {
     report: null,
     error: null,
   });
+  const [actionAnnouncement, setActionAnnouncement] = useState("");
   const lastPersistedRows = useRef<string | null>(null);
   const lastPersistedWidths = useRef<string | null>(null);
   const lastPersistedErrorLog = useRef<string | null>(null);
-  const lastPersistedUsageLog = useRef<string | null>(null);
-  const settingsPayloadRef = useRef<PersistedSettingsState | null>(null);
-  const modelLabelsRef = useRef<Record<string, string>>({});
-  const deriveModelLabel = useCallback((modelId: string | null) => {
-    if (!modelId) {
-      return DEFAULT_MODEL_ID;
+  const actionAnnouncementTimeoutRef = useRef<number | null>(null);
+
+  const announceAction = useCallback((message: string) => {
+    if (actionAnnouncementTimeoutRef.current !== null) {
+      window.clearTimeout(actionAnnouncementTimeoutRef.current);
+      actionAnnouncementTimeoutRef.current = null;
     }
 
-    const trimmed = modelId.trim();
-    if (!trimmed) {
-      return DEFAULT_MODEL_ID;
-    }
+    setActionAnnouncement(message);
 
-    return modelLabelsRef.current[trimmed] ?? trimmed;
+    if (message) {
+      actionAnnouncementTimeoutRef.current = window.setTimeout(() => {
+        setActionAnnouncement("");
+        actionAnnouncementTimeoutRef.current = null;
+      }, 2600);
+    }
   }, []);
-  const updateSettingsSnapshot = useCallback(
-    (payload: PersistedSettingsState | null) => {
-      settingsPayloadRef.current = payload;
 
-      const nextRateLimit = clampRateLimit(payload?.rateLimitPerMinute);
-      setRateLimitPerMinute(nextRateLimit);
-
-      const selectedModelId =
-        payload?.selectedModelId && payload.selectedModelId.trim()
-          ? payload.selectedModelId
-          : DEFAULT_MODEL_ID;
-
-      setSettingsSnapshot({
-        modelId: selectedModelId,
-        modelLabel: deriveModelLabel(selectedModelId),
-        webSearchEnabled: Boolean(payload?.webSearchEnabled),
-        maxTokens: sanitizeNumericPreference(payload?.maxTokens),
-        temperature: sanitizeNumericPreference(payload?.temperature),
-        repetitionPenalty: sanitizeNumericPreference(payload?.repetitionPenalty),
-        topP: sanitizeNumericPreference(payload?.topP),
-        topK: sanitizeNumericPreference(payload?.topK),
-        reasoningLevel:
-          payload?.reasoningLevel === "standard" || payload?.reasoningLevel === "deep"
-            ? payload.reasoningLevel
-            : "off",
-        rateLimitPerMinute: nextRateLimit,
-      });
-    },
-    [deriveModelLabel],
-  );
+  useEffect(() => {
+    return () => {
+      if (actionAnnouncementTimeoutRef.current !== null) {
+        window.clearTimeout(actionAnnouncementTimeoutRef.current);
+      }
+    };
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
@@ -375,6 +367,39 @@ export default function HomeContent() {
       unsubscribe();
     };
   }, []);
+
+  const persistSystemActivation = useCallback(
+    async (nextActive: boolean) => {
+      const requestId = systemSyncRequestIdRef.current + 1;
+      systemSyncRequestIdRef.current = requestId;
+      failedSystemTargetRef.current = null;
+      hasAppliedInitialSystemStateRef.current = true;
+      setSystemHydrated(true);
+      setSystemSyncState("syncing");
+      setSystemSyncMessage(null);
+
+      try {
+        await saveSystemState({ active: nextActive, updatedAt: createTimestamp() });
+
+        if (systemSyncRequestIdRef.current === requestId) {
+          confirmedSystemStateRef.current = nextActive;
+          failedSystemTargetRef.current = null;
+          setSystemSyncState("idle");
+          setSystemSyncMessage(null);
+        }
+      } catch (error) {
+        console.error("Unable to persist system status", error);
+
+        if (systemSyncRequestIdRef.current === requestId) {
+          failedSystemTargetRef.current = nextActive;
+          setSystemSyncState("error");
+          setSystemSyncMessage(SYSTEM_SYNC_ERROR_MESSAGE);
+          setSystemActive(confirmedSystemStateRef.current);
+        }
+      }
+    },
+    [],
+  );
 
   useEffect(() => {
     if (typeof window === "undefined") {
@@ -545,93 +570,6 @@ export default function HomeContent() {
     return () => {
       cancelled = true;
       unsubscribe();
-    };
-  }, []);
-
-  useEffect(() => {
-    let cancelled = false;
-
-    const hydrateUsageLog = async () => {
-      try {
-        const stored = await loadUsageLog();
-        if (!cancelled) {
-          const normalized = normalizeUsageLogEntries(stored);
-          setUsageLog(normalized);
-          lastPersistedUsageLog.current = JSON.stringify(normalized);
-        }
-      } catch (error) {
-        console.error("Unable to restore usage log", error);
-      } finally {
-        if (!cancelled) {
-          setUsageLogHydrated(true);
-        }
-      }
-    };
-
-    hydrateUsageLog();
-
-    const unsubscribe = subscribeToUsageLog((stored) => {
-      if (cancelled) {
-        return;
-      }
-
-      const normalized = normalizeUsageLogEntries(stored);
-      const serialized = JSON.stringify(normalized);
-      if (lastPersistedUsageLog.current === serialized) {
-        setUsageLogHydrated(true);
-        return;
-      }
-
-      lastPersistedUsageLog.current = serialized;
-      setUsageLog(normalized);
-      setUsageLogHydrated(true);
-    });
-
-    return () => {
-      cancelled = true;
-      unsubscribe();
-    };
-  }, []);
-
-  useEffect(() => {
-    if (typeof window === "undefined") {
-      return;
-    }
-
-    let cancelled = false;
-
-    const loadQaReport = async () => {
-      try {
-        const response = await fetch(QA_REPORT_ENDPOINT, { cache: "no-store" });
-        if (!response.ok) {
-          throw new Error(`Request failed (${response.status})`);
-        }
-
-        const payload = (await response.json()) as QaReport;
-        if (!cancelled) {
-          setQaStatus({ state: "loaded", report: payload, error: null });
-        }
-      } catch (error) {
-        if (!cancelled) {
-          setQaStatus({
-            state: "error",
-            report: null,
-            error:
-              error instanceof Error
-                ? error.message
-                : "Unable to load QA report.",
-          });
-        }
-      }
-    };
-
-    setQaStatus({ state: "loading", report: null, error: null });
-    loadQaReport();
-    const interval = window.setInterval(loadQaReport, QA_REFRESH_INTERVAL_MS);
-
-    return () => {
-      cancelled = true;
-      window.clearInterval(interval);
     };
   }, []);
 
@@ -984,6 +922,53 @@ export default function HomeContent() {
     });
   }, [selectedRowIds]);
 
+  const handleCopySelectedValues = useCallback(
+    async (field: "input" | "output") => {
+      if (!selectedRowIds.size) {
+        announceAction(
+          `Select rows to copy ${field === "input" ? "inputs" : "outputs"}.`,
+        );
+        return;
+      }
+
+      const selectedRows = rows.filter((row) => selectedRowIds.has(row.rowId));
+      if (!selectedRows.length) {
+        announceAction(
+          `Selected rows are outside the current filter. Adjust filters to copy ${
+            field === "input" ? "inputs" : "outputs"
+          }.`,
+        );
+        return;
+      }
+
+      const normalized = selectedRows.map((row) => ensureRowInitialized(row)[field] ?? "");
+      const payload = normalized.join("\n");
+      const pluralLabel = field === "input" ? "inputs" : "outputs";
+      const capitalizedLabel = field === "input" ? "Inputs" : "Outputs";
+
+      try {
+        const success = await writeTextToClipboard(payload);
+        if (success) {
+          const hasContent = normalized.some((value) => value.trim().length > 0);
+          const rowLabel = `row${selectedRows.length === 1 ? "" : "s"}`;
+          if (hasContent) {
+            announceAction(
+              `${capitalizedLabel} copied for ${selectedRows.length.toLocaleString()} ${rowLabel}.`,
+            );
+          } else {
+            announceAction(`Copied ${pluralLabel}, but they are currently empty.`);
+          }
+        } else {
+          announceAction(`Unable to access the clipboard. ${capitalizedLabel} not copied.`);
+        }
+      } catch (error) {
+        console.error(`Unable to copy ${pluralLabel}`, error);
+        announceAction(`Unable to copy ${pluralLabel}. Try again or copy manually.`);
+      }
+    },
+    [announceAction, rows, selectedRowIds],
+  );
+
   const handleClearErrorLog = useCallback(() => {
     if (!errorLog.length) {
       return;
@@ -999,9 +984,244 @@ export default function HomeContent() {
     setErrorLog([]);
   }, [errorLog.length]);
 
-  const toggleSystem = () => {
-    setSystemActive((previous) => !previous);
-  };
+  const toggleSystem = useCallback(() => {
+    const next = !systemActive;
+    setSystemActive(next);
+    void persistSystemActivation(next);
+  }, [persistSystemActivation, systemActive]);
+
+  const handleRetrySystemSync = useCallback(() => {
+    const target = failedSystemTargetRef.current;
+
+    if (target === null) {
+      setSystemSyncState("idle");
+      setSystemSyncMessage(null);
+      return;
+    }
+
+    setSystemActive(target);
+    void persistSystemActivation(target);
+  }, [persistSystemActivation]);
+
+  const refreshQaReport = useCallback(
+    async (shouldCancel?: () => boolean) => {
+      setQaStatus((previous) => ({
+        state: "loading",
+        report: previous.report,
+        error: null,
+      }));
+
+      try {
+        const response = await fetch(QA_REPORT_ENDPOINT, { cache: "no-store" });
+        if (!response.ok) {
+          throw new Error(`Request failed (${response.status})`);
+        }
+
+        const payload = (await response.json()) as QaReport;
+        if (shouldCancel?.()) {
+          return;
+        }
+
+        setQaStatus({ state: "loaded", report: payload, error: null });
+      } catch (error) {
+        const message =
+          error instanceof Error ? error.message : "Unable to load QA report.";
+
+        if (shouldCancel?.()) {
+          return;
+        }
+
+        setQaStatus({ state: "error", report: null, error: message });
+        throw new Error(message);
+      }
+    },
+    [],
+  );
+
+  const handleManualRefresh = useCallback(
+    async (tabId: TabId) => {
+      if (tabId === "settings") {
+        setTabRefreshState((previous) => ({
+          ...previous,
+          settings: { status: "idle", message: SETTINGS_REFRESH_INFO_MESSAGE },
+        }));
+        return;
+      }
+
+      setTabRefreshState((previous) => ({
+        ...previous,
+        [tabId]: { status: "refreshing", message: null },
+      }));
+
+      const setRefreshIdle = () => {
+        setTabRefreshState((previous) => ({
+          ...previous,
+          [tabId]: { status: "idle", message: null },
+        }));
+      };
+
+      const setRefreshError = (message: string) => {
+        setTabRefreshState((previous) => ({
+          ...previous,
+          [tabId]: { status: "error", message },
+        }));
+      };
+
+      try {
+        if (tabId === "generate") {
+          const [systemResult, rowsResult, widthsResult, errorLogResult] =
+            await Promise.allSettled([
+              loadSystemState(),
+              loadGridRows(),
+              loadColumnWidths(),
+              loadErrorLog(),
+            ]);
+
+          const failures: string[] = [];
+
+          if (systemResult.status === "fulfilled") {
+            if (systemResult.value) {
+              commitSystemState(systemResult.value);
+            } else {
+              setSystemHydrated(true);
+            }
+          } else {
+            console.error("Unable to refresh system status", systemResult.reason);
+            failures.push("system status");
+          }
+
+          if (rowsResult.status === "fulfilled") {
+            const storedRows = rowsResult.value;
+            const nextRows = storedRows.length ? storedRows : seedRows();
+            setRows(nextRows);
+            lastPersistedRows.current = JSON.stringify(nextRows);
+            setRowsHydrated(true);
+          } else {
+            console.error("Unable to refresh grid rows", rowsResult.reason);
+            failures.push("grid rows");
+          }
+
+          if (widthsResult.status === "fulfilled") {
+            const storedWidths = widthsResult.value;
+            setColumnWidths((previous) => {
+              const next = { ...previous, ...storedWidths };
+              lastPersistedWidths.current = JSON.stringify(next);
+              return next;
+            });
+            setColumnWidthsHydrated(true);
+          } else {
+            console.error("Unable to refresh column widths", widthsResult.reason);
+            failures.push("column widths");
+          }
+
+          if (errorLogResult.status === "fulfilled") {
+            const normalized = errorLogResult.value.slice(0, MAX_ERROR_LOG_ENTRIES);
+            setErrorLog(normalized);
+            lastPersistedErrorLog.current = JSON.stringify(normalized);
+            setErrorLogHydrated(true);
+          } else {
+            console.error("Unable to refresh error log", errorLogResult.reason);
+            failures.push("error log");
+          }
+
+          if (failures.length) {
+            setRefreshError(buildRefreshErrorMessage(failures));
+            return;
+          }
+
+          setRefreshIdle();
+          return;
+        }
+
+        if (tabId === "usage") {
+          try {
+            await refreshQaReport();
+            setRefreshIdle();
+          } catch (error) {
+            console.error("Unable to refresh QA report", error);
+            const message =
+              error instanceof Error
+                ? `Unable to refresh QA report: ${error.message}`
+                : "Unable to refresh QA report.";
+            setRefreshError(message);
+          }
+          return;
+        }
+
+        if (tabId === "updates") {
+          await updatesRefresh();
+          const { error } = useUpdatesStore.getState();
+          if (error) {
+            console.error("Unable to refresh updates", error);
+            setRefreshError(`Unable to refresh updates: ${error}.`);
+          } else {
+            setRefreshIdle();
+          }
+          return;
+        }
+
+        setRefreshIdle();
+      } catch (error) {
+        console.error("Unable to refresh active tab", error);
+        const message =
+          error instanceof Error
+            ? error.message
+            : "Unable to refresh the tab. Please try again.";
+        setRefreshError(message);
+      }
+    },
+    [commitSystemState, refreshQaReport, updatesRefresh],
+  );
+
+  useEffect(() => {
+    if (typeof window === "undefined") {
+      return;
+    }
+
+    let cancelled = false;
+
+    const runRefresh = () => refreshQaReport(() => cancelled).catch(() => {});
+
+    runRefresh();
+    const interval = window.setInterval(runRefresh, QA_REFRESH_INTERVAL_MS);
+
+    return () => {
+      cancelled = true;
+      window.clearInterval(interval);
+    };
+  }, [refreshQaReport]);
+
+  const hasActionableInputs = useMemo(() => {
+    return rows.some((row) => {
+      const normalized = ensureRowInitialized(row);
+      const status =
+        typeof normalized.status === "string" ? normalized.status.trim() : "";
+      const trimmedInputLength = normalized.input.trim().length;
+
+      switch (status) {
+        case "In Progress":
+          return true;
+        case "Pending":
+          return trimmedInputLength > 0;
+        case "Error": {
+          const retries = typeof normalized.retries === "number" ? normalized.retries : 0;
+          return trimmedInputLength > 0 && retries < 3;
+        }
+        default:
+          return false;
+      }
+    });
+  }, [rows]);
+
+  useEffect(() => {
+    if (!systemActive) {
+      return;
+    }
+
+    if (!hasActionableInputs) {
+      setSystemActive(false);
+    }
+  }, [hasActionableInputs, systemActive]);
 
   const { pending, inProgress, complete, totalCost, percentages, completionRatios } = useMemo(() => {
     let pendingCount = 0;
@@ -1257,25 +1477,51 @@ export default function HomeContent() {
     return (
       <section className="generate-container" aria-label="AI generation workspace">
         <div className="generate-topline">
-          <div className="generate-topline__block">
-            <h2 className="generate-topline__title">
-              System control <span className="hint-icon">(?)</span>
-            </h2>
-            <p className="generate-topline__text">
-              Toggle the generator when you are ready to process queued rows. Status counters update live so you can
-              see what is waiting, running, or finished.
-            </p>
-          </div>
+        <div className="generate-topline__block">
+          <h2 className="generate-topline__title">
+            System control <span className="hint-icon">(?)</span>
+          </h2>
+          <p className="generate-topline__text">
+            Toggle the generator when you are ready to process queued rows. Status counters update live so you can
+            see what is waiting, running, or finished.
+          </p>
+        </div>
+        <div className="system-toggle__group">
           <button
             type="button"
             className={`system-toggle${systemActive ? " system-toggle--active" : ""}`}
             onClick={toggleSystem}
             aria-pressed={systemActive}
+            aria-busy={systemSyncState === "syncing"}
           >
             <span className="system-toggle__state">{systemActive ? "On" : "Off"}</span>
             <span className="system-toggle__caption">Generation</span>
           </button>
+          {(systemSyncState === "syncing" || systemSyncState === "error") && (
+            <div
+              className={`system-toggle__feedback${
+                systemSyncState === "error" ? " system-toggle__feedback--error" : ""
+              }`}
+              role="status"
+              aria-live="polite"
+            >
+              {systemSyncState === "syncing" && (
+                <span className="system-toggle__feedback-text system-toggle__feedback-text--syncing">
+                  Syncing…
+                </span>
+              )}
+              {systemSyncState === "error" && (
+                <span className="system-toggle__feedback-text system-toggle__feedback-text--error" role="alert">
+                  {systemSyncMessage ?? SYSTEM_SYNC_ERROR_MESSAGE}
+                  <button type="button" className="system-toggle__retry" onClick={handleRetrySystemSync}>
+                    Retry
+                  </button>
+                </span>
+              )}
+            </div>
+          )}
         </div>
+      </div>
         <div className="generate-metrics" role="list">
           <div className="generate-metric" role="listitem">
             <span className="generate-metric__label">Pending rows</span>
@@ -1366,6 +1612,32 @@ export default function HomeContent() {
             <button
               type="button"
               className="grid-action-button"
+              onClick={() => {
+                void handleCopySelectedValues("input");
+              }}
+              title="Copy input text from all selected rows to the clipboard."
+              aria-label="Copy all inputs. Copies input text from all selected rows to the clipboard."
+              disabled={!selectedCount}
+            >
+              Copy All Inputs
+              <span className="grid-action-button__hint" aria-hidden="true">?</span>
+            </button>
+            <button
+              type="button"
+              className="grid-action-button"
+              onClick={() => {
+                void handleCopySelectedValues("output");
+              }}
+              title="Copy generated output from all selected rows to the clipboard."
+              aria-label="Copy all outputs. Copies generated output from all selected rows to the clipboard."
+              disabled={!selectedCount}
+            >
+              Copy All Outputs
+              <span className="grid-action-button__hint" aria-hidden="true">?</span>
+            </button>
+            <button
+              type="button"
+              className="grid-action-button"
               onClick={handleClearSelectedInputs}
               title="Remove input text from all selected rows."
               aria-label="Clear all inputs. Removes input text from all selected rows."
@@ -1407,6 +1679,9 @@ export default function HomeContent() {
               Deselect All
               <span className="grid-action-button__hint" aria-hidden="true">?</span>
             </button>
+            <div className="sr-only" aria-live="polite">
+              {actionAnnouncement}
+            </div>
           </div>
         </div>
         <div className="grid-container" aria-label="AI grid workspace">
@@ -1685,6 +1960,114 @@ export default function HomeContent() {
     );
   };
 
+  const tabStatuses = useMemo<Record<TabId, TabStatus>>(() => {
+    const generateStatus: TabStatus =
+      !systemHydrated ||
+      !rowsHydrated ||
+      !columnWidthsHydrated ||
+      !errorLogHydrated ||
+      systemSyncState === "syncing"
+        ? "updating"
+        : systemSyncState === "error"
+          ? "error"
+          : "idle";
+
+    const usageStatus: TabStatus =
+      qaStatus.state === "loading"
+        ? "updating"
+        : qaStatus.state === "error"
+          ? "error"
+          : "idle";
+
+    const updatesStatus: TabStatus = updatesLoading
+      ? "updating"
+      : updatesError
+        ? "error"
+        : "idle";
+
+    const applyRefresh = (tabId: TabId, status: TabStatus): TabStatus => {
+      const refresh = tabRefreshState[tabId];
+      if (refresh.status === "refreshing") {
+        return "updating";
+      }
+      if (refresh.status === "error") {
+        return "error";
+      }
+      return status;
+    };
+
+    return {
+      generate: applyRefresh("generate", generateStatus),
+      settings: applyRefresh("settings", "idle"),
+      usage: applyRefresh("usage", usageStatus),
+      updates: applyRefresh("updates", updatesStatus),
+    };
+  }, [
+    columnWidthsHydrated,
+    errorLogHydrated,
+    qaStatus.state,
+    rowsHydrated,
+    systemHydrated,
+    systemSyncState,
+    tabRefreshState,
+    updatesError,
+    updatesLoading,
+  ]);
+
+  const handleTabChange = useCallback((tabId: TabId) => {
+    setActiveTab(tabId);
+    setMountedTabs((previous) => {
+      if (previous.has(tabId)) {
+        return previous;
+      }
+
+      const next = new Set(previous);
+      next.add(tabId);
+      return next;
+    });
+  }, []);
+
+  const renderTabPanel = useCallback(
+    (tabId: TabId) => {
+      switch (tabId) {
+        case "generate":
+          return renderGenerateView();
+        case "settings":
+          return (
+            <section className="settings-container" aria-label="Application settings">
+              <SettingsPanel />
+            </section>
+          );
+        case "usage":
+          return renderUsageView();
+        case "updates":
+          return (
+            <section className="updates-container" aria-label="Recent application updates">
+              <UpdatesPanel />
+            </section>
+          );
+        default:
+          return null;
+      }
+    },
+    [renderGenerateView, renderUsageView],
+  );
+
+  const activeTabDefinition = useMemo(
+    () => TABS.find((tab) => tab.id === activeTab) ?? TABS[0],
+    [activeTab],
+  );
+  const activeTabRefreshState = tabRefreshState[activeTab];
+  const isRefreshInFlight = activeTabRefreshState.status === "refreshing";
+  const refreshButtonText = isRefreshInFlight ? "Refreshing…" : "Refresh";
+  const refreshButtonAriaLabel = `${
+    isRefreshInFlight ? "Refreshing" : "Refresh"
+  } ${activeTabDefinition.label} view`;
+  const refreshButtonTitle =
+    activeTab === "settings"
+      ? "Settings sync instantly with saved preferences."
+      : "Refresh the active tab if background updates lag.";
+
   return (
     <main className="grid-page-shell">
       <div className="grid-heading">
@@ -1696,32 +2079,87 @@ export default function HomeContent() {
             columns protected from manual edits.
           </p>
         </div>
-        <nav className="tab-navigation" aria-label="Primary views">
-          {TABS.map((tab) => (
+        <div className="tab-navigation__header">
+          <nav className="tab-navigation" aria-label="Primary views">
+            {TABS.map((tab) => {
+              const status = tabStatuses[tab.id];
+              const isActive = activeTab === tab.id;
+
+              return (
+                <button
+                  key={tab.id}
+                  id={`tab-${tab.id}`}
+                  type="button"
+                  className={`tab-navigation__button${isActive ? " tab-navigation__button--active" : ""}${
+                    status === "updating" ? " tab-navigation__button--updating" : ""
+                  }${status === "error" ? " tab-navigation__button--error" : ""}`}
+                  onClick={() => handleTabChange(tab.id)}
+                  aria-pressed={isActive}
+                  aria-controls={`tab-panel-${tab.id}`}
+                >
+                  <span className="tab-navigation__label">{tab.label}</span>
+                  {status !== "idle" && (
+                    <span
+                      className={`tab-navigation__status${
+                        status === "error" ? " tab-navigation__status--error" : ""
+                      }`}
+                      aria-live="polite"
+                    >
+                      {status === "updating" ? "Updating" : "Attention"}
+                    </span>
+                  )}
+                </button>
+              );
+            })}
+          </nav>
+          <div className="tab-navigation__actions">
             <button
-              key={tab.id}
               type="button"
-              className={`tab-navigation__button${activeTab === tab.id ? " tab-navigation__button--active" : ""}`}
-              onClick={() => setActiveTab(tab.id)}
-              aria-pressed={activeTab === tab.id}
+              className="tab-navigation__refresh-button"
+              onClick={() => handleManualRefresh(activeTab)}
+              disabled={isRefreshInFlight}
+              aria-label={refreshButtonAriaLabel}
+              title={refreshButtonTitle}
             >
-              {tab.label}
+              {refreshButtonText}
             </button>
-          ))}
-        </nav>
+            {activeTabRefreshState.message && (
+              <span
+                className={`tab-navigation__refresh-message${
+                  activeTabRefreshState.status === "error"
+                    ? " tab-navigation__refresh-message--error"
+                    : ""
+                }`}
+                role="status"
+                aria-live="polite"
+              >
+                {activeTabRefreshState.message}
+              </span>
+            )}
+          </div>
+        </div>
       </div>
-      {activeTab === "generate" && renderGenerateView()}
-      {activeTab === "settings" && (
-        <section className="settings-container" aria-label="Application settings">
-          <SettingsPanel />
-        </section>
-      )}
-      {activeTab === "usage" && renderUsageView()}
-      {activeTab === "updates" && (
-        <section className="updates-container" aria-label="Recent application updates">
-          <UpdatesPanel />
-        </section>
-      )}
+      <div className="tab-panels">
+        {TABS.map((tab) => {
+          const isActive = activeTab === tab.id;
+          const isMounted = mountedTabs.has(tab.id);
+          const status = tabStatuses[tab.id];
+
+          return (
+            <section
+              key={tab.id}
+              id={`tab-panel-${tab.id}`}
+              role="tabpanel"
+              aria-labelledby={`tab-${tab.id}`}
+              className={`tab-panel${isActive ? " tab-panel--active" : ""}`}
+              hidden={!isActive}
+              aria-busy={status === "updating"}
+            >
+              {isMounted ? renderTabPanel(tab.id) : null}
+            </section>
+          );
+        })}
+      </div>
     </main>
   );
 }

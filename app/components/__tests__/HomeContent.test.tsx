@@ -2,6 +2,20 @@ import React from "react";
 import { render, screen, within, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { act } from "react";
+import { useUpdatesStore } from "../../stores/updatesStore";
+
+const writeTextToClipboardMock = vi.fn(async (_text: string) => true);
+
+vi.mock("../../../lib/clipboard", async () => {
+  const actual = await vi.importActual<typeof import("../../../lib/clipboard")>(
+    "../../../lib/clipboard",
+  );
+
+  return {
+    ...actual,
+    writeTextToClipboard: writeTextToClipboardMock,
+  };
+});
 
 vi.mock("../CoreGrid", async () => {
   const actual = await vi.importActual<typeof import("../CoreGrid")>("../CoreGrid");
@@ -53,7 +67,7 @@ vi.mock("../CoreGrid", async () => {
 });
 
 type GridRepositoryModule = typeof import("../../../lib/gridRepository");
-type UsageRepositoryModule = typeof import("../../../lib/usageLogRepository");
+type SystemRepositoryModule = typeof import("../../../lib/systemRepository");
 
 const createGridRepositoryMock = () => {
   let rows: Array<any> = [];
@@ -121,43 +135,56 @@ const gridRepositoryMock = createGridRepositoryMock();
 
 vi.mock("../../../lib/gridRepository", () => gridRepositoryMock);
 
-const createUsageRepositoryMock = () => {
-  let entries: Array<any> = [];
-  const listeners = new Set<(payload: any[]) => void>();
-  const loadUsageLog = vi.fn(async () => entries);
-  const saveUsageLog = vi.fn(async (next: any[]) => {
-    entries = next;
-  });
-  const subscribeToUsageLog = vi.fn((handler: (payload: any[]) => void) => {
-    listeners.add(handler);
-    return () => {
-      listeners.delete(handler);
-    };
-  });
+const createSystemRepositoryMock = () => {
+  let state: any = null;
+  const listeners = new Set<(payload: any) => void>();
+  const loadSystemState = vi.fn<ReturnType<SystemRepositoryModule["loadSystemState"]>, Parameters<SystemRepositoryModule["loadSystemState"]>>();
+  const saveSystemState = vi.fn<ReturnType<SystemRepositoryModule["saveSystemState"]>, Parameters<SystemRepositoryModule["saveSystemState"]>>();
+  const subscribeToSystemState = vi.fn<
+    ReturnType<SystemRepositoryModule["subscribeToSystemState"]>,
+    Parameters<SystemRepositoryModule["subscribeToSystemState"]>
+  >();
+
+  const applyDefaultImplementation = () => {
+    loadSystemState.mockImplementation(async () => state);
+    saveSystemState.mockImplementation(async (payload: any) => {
+      state = payload;
+      listeners.forEach((listener) => listener(payload));
+    });
+    subscribeToSystemState.mockImplementation((handler: (payload: any) => void) => {
+      listeners.add(handler);
+      return () => {
+        listeners.delete(handler);
+      };
+    });
+  };
+
+  applyDefaultImplementation();
 
   return {
-    loadUsageLog,
-    saveUsageLog,
-    subscribeToUsageLog,
-    __setEntries(next: any[]) {
-      entries = next;
+    loadSystemState,
+    saveSystemState,
+    subscribeToSystemState,
+    __setState(next: any) {
+      state = next;
     },
     __reset() {
-      entries = [];
+      state = null;
       listeners.clear();
-      loadUsageLog.mockReset();
-      saveUsageLog.mockReset();
-      subscribeToUsageLog.mockReset();
+      loadSystemState.mockReset();
+      saveSystemState.mockReset();
+      subscribeToSystemState.mockReset();
+      applyDefaultImplementation();
     },
-  } satisfies Partial<UsageRepositoryModule> & {
-    __setEntries: (next: any[]) => void;
+  } satisfies Partial<SystemRepositoryModule> & {
+    __setState: (next: any) => void;
     __reset: () => void;
   };
 };
 
-const usageLogRepositoryMock = createUsageRepositoryMock();
+const systemRepositoryMock = createSystemRepositoryMock();
 
-vi.mock("../../../lib/usageLogRepository", () => usageLogRepositoryMock);
+vi.mock("../../../lib/systemRepository", () => systemRepositoryMock);
 
 vi.mock("../UpdatesPanel", () => ({
   __esModule: true,
@@ -208,7 +235,7 @@ const getMetricValue = (label: string) => {
 describe("HomeContent", () => {
   beforeEach(() => {
     gridRepositoryMock.__reset();
-    usageLogRepositoryMock.__reset();
+    systemRepositoryMock.__reset();
     settingsState = null;
     settingsListeners.clear();
     vi.restoreAllMocks();
@@ -228,6 +255,7 @@ describe("HomeContent", () => {
         },
       ),
     );
+    writeTextToClipboardMock.mockClear();
   });
 
   it("hydrates saved rows, updates metrics, and persists changes", async () => {
@@ -312,6 +340,31 @@ describe("HomeContent", () => {
     expect(screen.getByText(/selected/)).toHaveTextContent("2");
   });
 
+  it("copies selected inputs and outputs via action shortcuts", async () => {
+    const init = await ensureRowInitialized();
+    gridRepositoryMock.__setRows([
+      init({ rowId: "row-1", status: "Pending", input: "alpha", output: "" }),
+      init({ rowId: "row-2", status: "Complete", input: "beta", output: "gamma" }),
+    ]);
+
+    const HomeContent = await loadHomeContent();
+    render(<HomeContent />);
+
+    await screen.findByTestId("core-grid-mock");
+
+    const selectAll = screen.getByTestId("select-all");
+    await userEvent.click(selectAll);
+
+    const copyInputsButton = screen.getByRole("button", { name: /copy all inputs/i });
+    await userEvent.click(copyInputsButton);
+    expect(writeTextToClipboardMock).toHaveBeenCalledWith("alpha\nbeta");
+
+    writeTextToClipboardMock.mockClear();
+    const copyOutputsButton = screen.getByRole("button", { name: /copy all outputs/i });
+    await userEvent.click(copyOutputsButton);
+    expect(writeTextToClipboardMock).toHaveBeenCalledWith("\ngamma");
+  });
+
   it("advances generation state when the system toggle is enabled", async () => {
     const intervalCallbacks: Array<() => void> = [];
     vi.spyOn(Math, "random").mockReturnValue(0.9);
@@ -349,6 +402,12 @@ describe("HomeContent", () => {
     await userEvent.click(toggle);
     expect(toggle).toHaveAttribute("aria-pressed", "true");
 
+    await waitFor(() => {
+      expect(systemRepositoryMock.saveSystemState).toHaveBeenCalledWith(
+        expect.objectContaining({ active: true }),
+      );
+    });
+
     expect(intervalCallbacks).not.toHaveLength(0);
 
     await act(async () => {
@@ -365,8 +424,8 @@ describe("HomeContent", () => {
 
     const lastPersisted =
       gridRepositoryMock.saveGridRows.mock.calls[
-        gridRepositoryMock.saveGridRows.mock.calls.length - 1
-      ][0];
+      gridRepositoryMock.saveGridRows.mock.calls.length - 1
+    ][0];
     expect(lastPersisted).toEqual(
       expect.arrayContaining([expect.objectContaining({ status: "Complete" })]),
     );
@@ -411,5 +470,79 @@ describe("HomeContent", () => {
         reasoningLevel: "deep",
       }),
     );
+  });
+
+  it("auto-disables generation when no actionable inputs exist", async () => {
+    const init = await ensureRowInitialized();
+    gridRepositoryMock.__setRows([
+      init({ rowId: "done", status: "Complete", input: "finished", output: "ok" }),
+      init({ rowId: "blank", status: "Pending", input: "" }),
+    ]);
+
+    const HomeContent = await loadHomeContent();
+    render(<HomeContent />);
+
+    const toggle = await screen.findByRole("button", { name: /generation/i });
+    await userEvent.click(toggle);
+
+    await waitFor(() => {
+      expect(toggle).toHaveAttribute("aria-pressed", "false");
+    });
+  });
+
+  it("turns off generation when only exhausted error rows remain", async () => {
+    const init = await ensureRowInitialized();
+    gridRepositoryMock.__setRows([
+      init({ rowId: "err", status: "Error", retries: 3, input: "still broken" }),
+    ]);
+
+    const HomeContent = await loadHomeContent();
+    render(<HomeContent />);
+
+    const toggle = await screen.findByRole("button", { name: /generation/i });
+    await userEvent.click(toggle);
+
+    await waitFor(() => {
+      expect(toggle).toHaveAttribute("aria-pressed", "false");
+    });
+  });
+
+  it("turns off generation after the final pending row completes", async () => {
+    const intervalCallbacks: Array<() => void> = [];
+    vi.spyOn(Math, "random").mockReturnValue(0.9);
+    vi.spyOn(window, "setInterval").mockImplementation((callback: TimerHandler) => {
+      const fn = callback as () => void;
+      intervalCallbacks.push(fn);
+      return 1 as unknown as number;
+    });
+    vi.spyOn(window, "clearInterval").mockImplementation(() => {});
+
+    const init = await ensureRowInitialized();
+    gridRepositoryMock.__setRows([
+      init({ rowId: "pending-final", status: "Pending", input: "process me" }),
+    ]);
+
+    const HomeContent = await loadHomeContent();
+    render(<HomeContent />);
+
+    const toggle = await screen.findByRole("button", { name: /generation/i });
+    await userEvent.click(toggle);
+    expect(toggle).toHaveAttribute("aria-pressed", "true");
+
+    await act(async () => {
+      intervalCallbacks.forEach((callback) => callback());
+    });
+
+    await act(async () => {
+      intervalCallbacks.forEach((callback) => callback());
+    });
+
+    await waitFor(() => {
+      expect(gridRepositoryMock.saveGridRows).toHaveBeenCalled();
+    });
+
+    await waitFor(() => {
+      expect(toggle).toHaveAttribute("aria-pressed", "false");
+    });
   });
 });
