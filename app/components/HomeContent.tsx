@@ -23,7 +23,20 @@ import {
   subscribeToErrorLog,
   subscribeToGridRows,
 } from "../../lib/gridRepository";
-import { loadSettingsState, subscribeToSettingsState } from "../../lib/settingsRepository";
+import {
+  loadSettingsState,
+  subscribeToSettingsState,
+  loadModelCatalog,
+  subscribeToModelCatalog,
+  type PersistedSettingsState,
+  type PersistedModelCatalog,
+} from "../../lib/settingsRepository";
+import {
+  loadUsageLog,
+  saveUsageLog,
+  StoredUsageLogEntry,
+  subscribeToUsageLog,
+} from "../../lib/usageLogRepository";
 
 type TabId = "generate" | "settings" | "usage" | "updates";
 
@@ -34,17 +47,7 @@ const TABS: { id: TabId; label: string }[] = [
   { id: "updates", label: "Updates" },
 ];
 
-type UsageEntry = {
-  id: string;
-  rowId: string;
-  inputPreview: string;
-  outputPreview: string;
-  inputTokens: number;
-  outputTokens: number;
-  cost: number;
-  model: string;
-  timestamp: string;
-};
+type UsageEntry = StoredUsageLogEntry;
 
 type ErrorLogEntry = StoredErrorLogEntry;
 
@@ -57,8 +60,24 @@ type GridFilters = {
 
 const DEFAULT_RATE_LIMIT = 120;
 const MAX_ERROR_LOG_ENTRIES = 80;
+const MAX_USAGE_LOG_ENTRIES = 500;
 const QA_REPORT_ENDPOINT = "/qa/latest.json";
 const QA_REFRESH_INTERVAL_MS = 5 * 60 * 1000;
+
+const DEFAULT_MODEL_ID = "gpt-4-turbo";
+
+type SettingsSnapshot = {
+  modelId: string;
+  modelLabel: string;
+  webSearchEnabled: boolean;
+  maxTokens: number | null;
+  temperature: number | null;
+  repetitionPenalty: number | null;
+  topP: number | null;
+  topK: number | null;
+  reasoningLevel: "off" | "standard" | "deep";
+  rateLimitPerMinute: number;
+};
 
 type QaCoverage = {
   statements: number | null;
@@ -95,6 +114,42 @@ const computeCost = (inputTokens: number, outputTokens: number) => {
   return Number((totalTokens * unitCost).toFixed(4));
 };
 
+const clampRateLimit = (value: number | "" | null | undefined): number => {
+  if (value === "") {
+    return DEFAULT_RATE_LIMIT;
+  }
+
+  if (typeof value !== "number" || Number.isNaN(value) || !Number.isFinite(value)) {
+    return DEFAULT_RATE_LIMIT;
+  }
+
+  return Math.min(Math.max(Math.round(value), 1), 250);
+};
+
+const sanitizeNumericPreference = (value: number | "" | null | undefined): number | null => {
+  if (value === "") {
+    return null;
+  }
+
+  if (typeof value !== "number" || Number.isNaN(value) || !Number.isFinite(value)) {
+    return null;
+  }
+
+  return value;
+};
+
+const formatNullableNumber = (
+  value: number | null,
+  options: Intl.NumberFormatOptions & { fallback?: string } = { maximumFractionDigits: 2 },
+) => {
+  if (value === null) {
+    return options.fallback ?? "—";
+  }
+
+  const formatter = new Intl.NumberFormat(undefined, options);
+  return formatter.format(value);
+};
+
 const applyDerivedMetrics = (row: GridRow): GridRow => {
   const inputTokens = countTokens(row.input);
   const outputTokens = countTokens(row.output);
@@ -122,6 +177,29 @@ const parseNumericFilter = (value: string): number | null => {
   }
 
   return numeric;
+};
+
+const sortUsageEntries = (entries: UsageEntry[]): UsageEntry[] => {
+  return [...entries].sort((a, b) => {
+    const right = Date.parse(b.timestamp);
+    const left = Date.parse(a.timestamp);
+
+    if (Number.isNaN(right) && Number.isNaN(left)) {
+      return 0;
+    }
+    if (Number.isNaN(right)) {
+      return 1;
+    }
+    if (Number.isNaN(left)) {
+      return -1;
+    }
+
+    return right - left;
+  });
+};
+
+const normalizeUsageLogEntries = (entries: UsageEntry[]): UsageEntry[] => {
+  return sortUsageEntries(entries).slice(0, MAX_USAGE_LOG_ENTRIES);
 };
 
 const seedRows = (): GridRow[] => {
@@ -185,9 +263,24 @@ export default function HomeContent() {
   const [selectedRowIds, setSelectedRowIds] = useState<Set<string>>(() => new Set());
   const [errorLog, setErrorLog] = useState<ErrorLogEntry[]>([]);
   const [errorLogHydrated, setErrorLogHydrated] = useState(false);
+  const [usageLog, setUsageLog] = useState<UsageEntry[]>([]);
+  const [usageLogHydrated, setUsageLogHydrated] = useState(false);
   const [dateRange, setDateRange] = useState("last30");
   const [customRange, setCustomRange] = useState({ start: "", end: "" });
   const [rateLimitPerMinute, setRateLimitPerMinute] = useState(DEFAULT_RATE_LIMIT);
+  const [settingsSnapshot, setSettingsSnapshot] = useState<SettingsSnapshot>({
+    modelId: DEFAULT_MODEL_ID,
+    modelLabel: DEFAULT_MODEL_ID,
+    webSearchEnabled: false,
+    maxTokens: null,
+    temperature: null,
+    repetitionPenalty: null,
+    topP: null,
+    topK: null,
+    reasoningLevel: "off",
+    rateLimitPerMinute: DEFAULT_RATE_LIMIT,
+  });
+  const [modelLabels, setModelLabels] = useState<Record<string, string>>({});
   const [qaStatus, setQaStatus] = useState<QaStatusState>({
     state: "loading",
     report: null,
@@ -196,6 +289,51 @@ export default function HomeContent() {
   const lastPersistedRows = useRef<string | null>(null);
   const lastPersistedWidths = useRef<string | null>(null);
   const lastPersistedErrorLog = useRef<string | null>(null);
+  const lastPersistedUsageLog = useRef<string | null>(null);
+  const settingsPayloadRef = useRef<PersistedSettingsState | null>(null);
+  const modelLabelsRef = useRef<Record<string, string>>({});
+  const deriveModelLabel = useCallback((modelId: string | null) => {
+    if (!modelId) {
+      return DEFAULT_MODEL_ID;
+    }
+
+    const trimmed = modelId.trim();
+    if (!trimmed) {
+      return DEFAULT_MODEL_ID;
+    }
+
+    return modelLabelsRef.current[trimmed] ?? trimmed;
+  }, []);
+  const updateSettingsSnapshot = useCallback(
+    (payload: PersistedSettingsState | null) => {
+      settingsPayloadRef.current = payload;
+
+      const nextRateLimit = clampRateLimit(payload?.rateLimitPerMinute);
+      setRateLimitPerMinute(nextRateLimit);
+
+      const selectedModelId =
+        payload?.selectedModelId && payload.selectedModelId.trim()
+          ? payload.selectedModelId
+          : DEFAULT_MODEL_ID;
+
+      setSettingsSnapshot({
+        modelId: selectedModelId,
+        modelLabel: deriveModelLabel(selectedModelId),
+        webSearchEnabled: Boolean(payload?.webSearchEnabled),
+        maxTokens: sanitizeNumericPreference(payload?.maxTokens),
+        temperature: sanitizeNumericPreference(payload?.temperature),
+        repetitionPenalty: sanitizeNumericPreference(payload?.repetitionPenalty),
+        topP: sanitizeNumericPreference(payload?.topP),
+        topK: sanitizeNumericPreference(payload?.topK),
+        reasoningLevel:
+          payload?.reasoningLevel === "standard" || payload?.reasoningLevel === "deep"
+            ? payload.reasoningLevel
+            : "off",
+        rateLimitPerMinute: nextRateLimit,
+      });
+    },
+    [deriveModelLabel],
+  );
 
   useEffect(() => {
     let cancelled = false;
@@ -243,39 +381,79 @@ export default function HomeContent() {
       return;
     }
 
-    const clampRateLimit = (value: number | "" | null | undefined): number => {
-      if (value === "") {
-        return DEFAULT_RATE_LIMIT;
-      }
-
-      if (typeof value !== "number" || Number.isNaN(value) || !Number.isFinite(value)) {
-        return DEFAULT_RATE_LIMIT;
-      }
-
-      return Math.min(Math.max(Math.round(value), 1), 250);
-    };
-
     let cancelled = false;
 
-    const hydrateRateLimit = async () => {
+    const hydrateSettings = async () => {
       try {
         const stored = await loadSettingsState();
         if (!cancelled) {
-          const next = clampRateLimit(stored?.rateLimitPerMinute);
-          setRateLimitPerMinute(next);
+          updateSettingsSnapshot(stored);
         }
       } catch (error) {
-        console.error("Unable to hydrate rate limit preference", error);
+        console.error("Unable to hydrate settings snapshot", error);
       }
     };
 
-    hydrateRateLimit();
+    hydrateSettings();
     const unsubscribe = subscribeToSettingsState((payload) => {
       if (cancelled) {
         return;
       }
-      const next = clampRateLimit(payload?.rateLimitPerMinute);
-      setRateLimitPerMinute(next);
+      updateSettingsSnapshot(payload);
+    });
+
+    return () => {
+      cancelled = true;
+      unsubscribe();
+    };
+  }, [updateSettingsSnapshot]);
+
+  useEffect(() => {
+    modelLabelsRef.current = modelLabels;
+    updateSettingsSnapshot(settingsPayloadRef.current);
+  }, [modelLabels, updateSettingsSnapshot]);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    const extractLabels = (payload: PersistedModelCatalog | null) => {
+      if (!payload || !Array.isArray(payload.models)) {
+        return {} as Record<string, string>;
+      }
+
+      return payload.models.reduce<Record<string, string>>((accumulator, model) => {
+        if (!model || typeof model !== "object") {
+          return accumulator;
+        }
+
+        const identifier = typeof model.id === "string" ? model.id.trim() : "";
+        if (!identifier) {
+          return accumulator;
+        }
+
+        const label = typeof model.name === "string" && model.name.trim() ? model.name : identifier;
+        accumulator[identifier] = label;
+        return accumulator;
+      }, {});
+    };
+
+    const hydrateModelCatalog = async () => {
+      try {
+        const stored = await loadModelCatalog();
+        if (!cancelled) {
+          setModelLabels(extractLabels(stored));
+        }
+      } catch (error) {
+        console.error("Unable to restore cached model catalog", error);
+      }
+    };
+
+    hydrateModelCatalog();
+    const unsubscribe = subscribeToModelCatalog((payload) => {
+      if (cancelled) {
+        return;
+      }
+      setModelLabels(extractLabels(payload));
     });
 
     return () => {
@@ -362,6 +540,51 @@ export default function HomeContent() {
       lastPersistedErrorLog.current = serialized;
       setErrorLog(normalized);
       setErrorLogHydrated(true);
+    });
+
+    return () => {
+      cancelled = true;
+      unsubscribe();
+    };
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    const hydrateUsageLog = async () => {
+      try {
+        const stored = await loadUsageLog();
+        if (!cancelled) {
+          const normalized = normalizeUsageLogEntries(stored);
+          setUsageLog(normalized);
+          lastPersistedUsageLog.current = JSON.stringify(normalized);
+        }
+      } catch (error) {
+        console.error("Unable to restore usage log", error);
+      } finally {
+        if (!cancelled) {
+          setUsageLogHydrated(true);
+        }
+      }
+    };
+
+    hydrateUsageLog();
+
+    const unsubscribe = subscribeToUsageLog((stored) => {
+      if (cancelled) {
+        return;
+      }
+
+      const normalized = normalizeUsageLogEntries(stored);
+      const serialized = JSON.stringify(normalized);
+      if (lastPersistedUsageLog.current === serialized) {
+        setUsageLogHydrated(true);
+        return;
+      }
+
+      lastPersistedUsageLog.current = serialized;
+      setUsageLog(normalized);
+      setUsageLogHydrated(true);
     });
 
     return () => {
@@ -502,6 +725,107 @@ export default function HomeContent() {
 
     void persist();
   }, [errorLog, errorLogHydrated]);
+
+  useEffect(() => {
+    if (!usageLogHydrated) {
+      return;
+    }
+
+    const normalized = normalizeUsageLogEntries(usageLog);
+    const serialized = JSON.stringify(normalized);
+    if (lastPersistedUsageLog.current === serialized) {
+      return;
+    }
+
+    lastPersistedUsageLog.current = serialized;
+
+    const persist = async () => {
+      try {
+        await saveUsageLog(normalized);
+      } catch (error) {
+        console.error("Unable to persist usage log", error);
+      }
+    };
+
+    void persist();
+  }, [usageLog, usageLogHydrated]);
+
+  useEffect(() => {
+    if (!rowsHydrated || !usageLogHydrated) {
+      return;
+    }
+
+    setUsageLog((previous) => {
+      const knownIds = new Set(previous.map((entry) => entry.id));
+      const additions: UsageEntry[] = [];
+
+      rows.forEach((candidate) => {
+        const normalized = ensureRowInitialized(candidate);
+        if (normalized.status !== "Complete") {
+          return;
+        }
+
+        if (!normalized.input && !normalized.output) {
+          return;
+        }
+
+        const hasTimestamp =
+          Boolean(normalized.lastUpdated) && !Number.isNaN(Date.parse(normalized.lastUpdated));
+        const timestamp = hasTimestamp ? normalized.lastUpdated : createTimestamp();
+        const identifier = hasTimestamp
+          ? `${normalized.rowId}::${normalized.lastUpdated}`
+          : `${normalized.rowId}::${normalized.retries}-${normalized.inputTokens}-${normalized.outputTokens}-${normalized.costPerOutput}`;
+
+        if (knownIds.has(identifier)) {
+          return;
+        }
+
+        const promptCost = computeCost(normalized.inputTokens, 0);
+        const completionCost = computeCost(0, normalized.outputTokens);
+        const totalCost = computeCost(normalized.inputTokens, normalized.outputTokens);
+        const totalTokens = normalized.inputTokens + normalized.outputTokens;
+
+        additions.push({
+          id: identifier,
+          rowId: normalized.rowId,
+          timestamp,
+          model: settingsSnapshot.modelLabel,
+          modelId: settingsSnapshot.modelId,
+          webSearchEnabled: settingsSnapshot.webSearchEnabled,
+          rateLimitPerMinute: settingsSnapshot.rateLimitPerMinute,
+          status: normalized.status,
+          retries: normalized.retries,
+          input: normalized.input,
+          inputPreview: normalized.input.slice(0, 80),
+          inputCharacters: normalized.input.length,
+          output: normalized.output,
+          outputPreview: normalized.output.slice(0, 80),
+          outputCharacters: normalized.output.length,
+          len: normalized.len,
+          inputTokens: normalized.inputTokens,
+          outputTokens: normalized.outputTokens,
+          totalTokens,
+          promptCost,
+          completionCost,
+          cost: totalCost,
+          lastUpdated: normalized.lastUpdated,
+          errorStatus: normalized.errorStatus,
+          maxTokens: settingsSnapshot.maxTokens,
+          temperature: settingsSnapshot.temperature,
+          topP: settingsSnapshot.topP,
+          topK: settingsSnapshot.topK,
+          repetitionPenalty: settingsSnapshot.repetitionPenalty,
+          reasoningLevel: settingsSnapshot.reasoningLevel,
+        });
+      });
+
+      if (!additions.length) {
+        return previous;
+      }
+
+      return normalizeUsageLogEntries([...additions, ...previous]);
+    });
+  }, [rows, rowsHydrated, usageLogHydrated, settingsSnapshot]);
 
   const displayedRowIndices = useMemo(() => {
     const inputFilter = gridFilters.input.trim().toLowerCase();
@@ -793,38 +1117,25 @@ export default function HomeContent() {
       return [];
     }
 
-    const entries = rows
-      .filter((row) => row.status === "Complete" && (row.input || row.output))
-      .map((row) => {
-        const timestamp = row.lastUpdated ? Date.parse(row.lastUpdated) : NaN;
-        return { row, timestamp };
-      })
-      .filter(({ timestamp }) => !Number.isNaN(timestamp))
-      .filter(({ timestamp }) => {
-        if (rangeSelection.rangeStart !== null && timestamp < rangeSelection.rangeStart) {
-          return false;
-        }
-        if (rangeSelection.rangeEnd !== null && timestamp > rangeSelection.rangeEnd) {
-          return false;
-        }
-        return true;
-      })
-      .sort((a, b) => b.timestamp - a.timestamp)
-      .slice(0, 100)
-      .map(({ row }, index) => ({
-        id: `${row.rowId}-${index}`,
-        rowId: row.rowId,
-        inputPreview: row.input.slice(0, 80),
-        outputPreview: row.output.slice(0, 80),
-        inputTokens: row.inputTokens,
-        outputTokens: row.outputTokens,
-        cost: row.costPerOutput,
-        model: "gpt-4-turbo",
-        timestamp: row.lastUpdated || createTimestamp(),
-      }));
+    const filtered = usageLog.filter((entry) => {
+      const timestamp = Date.parse(entry.timestamp);
+      if (Number.isNaN(timestamp)) {
+        return false;
+      }
 
-    return entries;
-  }, [rangeSelection, rows]);
+      if (rangeSelection.rangeStart !== null && timestamp < rangeSelection.rangeStart) {
+        return false;
+      }
+
+      if (rangeSelection.rangeEnd !== null && timestamp > rangeSelection.rangeEnd) {
+        return false;
+      }
+
+      return true;
+    });
+
+    return filtered.slice(0, 100);
+  }, [rangeSelection, usageLog]);
 
   const usageSummary = useMemo(() => {
     return usageEntries.reduce(
@@ -1243,15 +1554,16 @@ export default function HomeContent() {
                   <th scope="col">Model</th>
                   <th scope="col">Input preview</th>
                   <th scope="col">Output preview</th>
-                  <th scope="col">Input tokens</th>
-                  <th scope="col">Output tokens</th>
-                  <th scope="col">Cost</th>
+                  <th scope="col">Tokens</th>
+                  <th scope="col">Characters</th>
+                  <th scope="col">Parameters</th>
+                  <th scope="col">Costs</th>
                 </tr>
               </thead>
               <tbody>
                 {usageEntries.length === 0 ? (
                   <tr>
-                    <td colSpan={7} className="usage-log__empty">
+                    <td colSpan={8} className="usage-log__empty">
                       {rangeSelection.rangeError
                         ? "Adjust the custom range to see usage entries."
                         : "No completed generations yet. Turn the system on from the Generate tab to start producing outputs."}
@@ -1260,13 +1572,77 @@ export default function HomeContent() {
                 ) : (
                   usageEntries.map((entry) => (
                     <tr key={entry.id}>
-                      <td>{new Date(entry.timestamp).toLocaleString()}</td>
-                      <td>{entry.model}</td>
+                      <td>
+                        <time dateTime={entry.timestamp}>
+                          {new Date(entry.timestamp).toLocaleString()}
+                        </time>
+                        <div className="usage-log__subtext">Row {entry.rowId.slice(0, 8)}</div>
+                        {entry.lastUpdated && entry.lastUpdated !== entry.timestamp && (
+                          <div className="usage-log__subtext">
+                            Updated {new Date(entry.lastUpdated).toLocaleString()}
+                          </div>
+                        )}
+                        {entry.retries > 0 && (
+                          <div className="usage-log__subtext">Retries: {entry.retries}</div>
+                        )}
+                      </td>
+                      <td>
+                        <div>{entry.model}</div>
+                        <div className="usage-log__subtext">{entry.modelId}</div>
+                        {entry.status && (
+                          <div className="usage-log__subtext">Status: {entry.status}</div>
+                        )}
+                        {entry.errorStatus && (
+                          <div className="usage-log__subtext" role="note">
+                            {entry.errorStatus}
+                          </div>
+                        )}
+                      </td>
                       <td>{entry.inputPreview || "—"}</td>
                       <td>{entry.outputPreview || "—"}</td>
-                      <td className="numeric">{entry.inputTokens.toLocaleString()}</td>
-                      <td className="numeric">{entry.outputTokens.toLocaleString()}</td>
-                      <td className="numeric">${entry.cost.toFixed(4)}</td>
+                      <td className="numeric">
+                        <div>In: {entry.inputTokens.toLocaleString()}</div>
+                        <div>Out: {entry.outputTokens.toLocaleString()}</div>
+                        <div>Total: {entry.totalTokens.toLocaleString()}</div>
+                      </td>
+                      <td className="numeric">
+                        <div>In: {entry.inputCharacters.toLocaleString()}</div>
+                        <div>Out: {entry.outputCharacters.toLocaleString()}</div>
+                        {entry.len !== null && (
+                          <div>Len metric: {entry.len.toLocaleString()}</div>
+                        )}
+                      </td>
+                      <td>
+                        <div className="usage-log__subtext">
+                          Web search: {entry.webSearchEnabled ? "on" : "off"}
+                        </div>
+                        <div className="usage-log__subtext">
+                          Rate limit: {entry.rateLimitPerMinute > 0
+                            ? `${entry.rateLimitPerMinute}/min`
+                            : "—"}
+                        </div>
+                        <div className="usage-log__subtext">
+                          Max tokens: {entry.maxTokens !== null ? entry.maxTokens : "—"}
+                        </div>
+                        <div className="usage-log__subtext">
+                          Temperature: {formatNullableNumber(entry.temperature)}
+                        </div>
+                        <div className="usage-log__subtext">
+                          Top P: {formatNullableNumber(entry.topP)}
+                        </div>
+                        <div className="usage-log__subtext">
+                          Top K: {formatNullableNumber(entry.topK, { maximumFractionDigits: 0 })}
+                        </div>
+                        <div className="usage-log__subtext">
+                          Repetition: {formatNullableNumber(entry.repetitionPenalty)}
+                        </div>
+                        <div className="usage-log__subtext">Reasoning: {entry.reasoningLevel}</div>
+                      </td>
+                      <td className="numeric">
+                        <div>Prompt: ${entry.promptCost.toFixed(4)}</div>
+                        <div>Completion: ${entry.completionCost.toFixed(4)}</div>
+                        <div>Total: ${entry.cost.toFixed(4)}</div>
+                      </td>
                     </tr>
                   ))
                 )}

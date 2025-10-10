@@ -1100,6 +1100,13 @@ body {
   font-variant-numeric: tabular-nums;
 }
 
+.usage-log__table .usage-log__subtext {
+  display: block;
+  font-size: 0.8rem;
+  color: #64748b;
+  margin-top: 2px;
+}
+
 .usage-log__empty {
   text-align: center;
   padding: 32px 12px;

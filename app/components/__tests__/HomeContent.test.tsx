@@ -53,6 +53,7 @@ vi.mock("../CoreGrid", async () => {
 });
 
 type GridRepositoryModule = typeof import("../../../lib/gridRepository");
+type UsageRepositoryModule = typeof import("../../../lib/usageLogRepository");
 
 const createGridRepositoryMock = () => {
   let rows: Array<any> = [];
@@ -120,6 +121,44 @@ const gridRepositoryMock = createGridRepositoryMock();
 
 vi.mock("../../../lib/gridRepository", () => gridRepositoryMock);
 
+const createUsageRepositoryMock = () => {
+  let entries: Array<any> = [];
+  const listeners = new Set<(payload: any[]) => void>();
+  const loadUsageLog = vi.fn(async () => entries);
+  const saveUsageLog = vi.fn(async (next: any[]) => {
+    entries = next;
+  });
+  const subscribeToUsageLog = vi.fn((handler: (payload: any[]) => void) => {
+    listeners.add(handler);
+    return () => {
+      listeners.delete(handler);
+    };
+  });
+
+  return {
+    loadUsageLog,
+    saveUsageLog,
+    subscribeToUsageLog,
+    __setEntries(next: any[]) {
+      entries = next;
+    },
+    __reset() {
+      entries = [];
+      listeners.clear();
+      loadUsageLog.mockReset();
+      saveUsageLog.mockReset();
+      subscribeToUsageLog.mockReset();
+    },
+  } satisfies Partial<UsageRepositoryModule> & {
+    __setEntries: (next: any[]) => void;
+    __reset: () => void;
+  };
+};
+
+const usageLogRepositoryMock = createUsageRepositoryMock();
+
+vi.mock("../../../lib/usageLogRepository", () => usageLogRepositoryMock);
+
 vi.mock("../UpdatesPanel", () => ({
   __esModule: true,
   default: () => <div data-testid="updates-panel-mock" />,
@@ -169,6 +208,7 @@ const getMetricValue = (label: string) => {
 describe("HomeContent", () => {
   beforeEach(() => {
     gridRepositoryMock.__reset();
+    usageLogRepositoryMock.__reset();
     settingsState = null;
     settingsListeners.clear();
     vi.restoreAllMocks();
@@ -226,6 +266,8 @@ describe("HomeContent", () => {
     expect(screen.getByText(/rows match/)).toHaveTextContent("3 rows match");
 
     expect(gridRepositoryMock.loadGridRows).toHaveBeenCalled();
+    expect(usageLogRepositoryMock.loadUsageLog).toHaveBeenCalled();
+    expect(usageLogRepositoryMock.subscribeToUsageLog).toHaveBeenCalled();
   });
 
   it("responds to cross-tab storage events by replacing rows", async () => {
@@ -280,6 +322,21 @@ describe("HomeContent", () => {
     });
     vi.spyOn(window, "clearInterval").mockImplementation(() => {});
 
+    settingsState = {
+      apiKey: "",
+      selectedModelId: "anthropic/claude-3-opus",
+      webSearchEnabled: true,
+      maxTokens: 2048,
+      temperature: 0.6,
+      repetitionPenalty: 1.1,
+      topP: 0.95,
+      topK: 30,
+      reasoningLevel: "deep",
+      rateLimitPerMinute: 180,
+      knownModelIds: [],
+      modelNotifications: [],
+    };
+
     const init = await ensureRowInitialized();
     gridRepositoryMock.__setRows([
       init({ rowId: "pending-1", status: "Pending", input: "process me" }),
@@ -312,6 +369,47 @@ describe("HomeContent", () => {
       ][0];
     expect(lastPersisted).toEqual(
       expect.arrayContaining([expect.objectContaining({ status: "Complete" })]),
+    );
+
+    await waitFor(() => {
+      expect(usageLogRepositoryMock.saveUsageLog).toHaveBeenCalled();
+    });
+
+    const usagePersisted =
+      usageLogRepositoryMock.saveUsageLog.mock.calls[
+        usageLogRepositoryMock.saveUsageLog.mock.calls.length - 1
+      ][0];
+
+    expect(Array.isArray(usagePersisted)).toBe(true);
+    expect(usagePersisted.length).toBeGreaterThan(0);
+    expect(usagePersisted[0]).toEqual(
+      expect.objectContaining({
+        rowId: "pending-1",
+        status: "Complete",
+        model: "anthropic/claude-3-opus",
+        modelId: "anthropic/claude-3-opus",
+        webSearchEnabled: true,
+        rateLimitPerMinute: 180,
+        inputPreview: expect.any(String),
+        outputPreview: expect.any(String),
+        inputTokens: expect.any(Number),
+        outputTokens: expect.any(Number),
+        totalTokens: expect.any(Number),
+        cost: expect.any(Number),
+        promptCost: expect.any(Number),
+        completionCost: expect.any(Number),
+        inputCharacters: expect.any(Number),
+        outputCharacters: expect.any(Number),
+        len: expect.any(Number),
+        timestamp: expect.any(String),
+        lastUpdated: expect.any(String),
+        maxTokens: 2048,
+        temperature: 0.6,
+        topP: 0.95,
+        topK: 30,
+        repetitionPenalty: 1.1,
+        reasoningLevel: "deep",
+      }),
     );
   });
 });
