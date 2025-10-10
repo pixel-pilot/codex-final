@@ -679,6 +679,38 @@ export default function HomeContent() {
     setSystemActive((previous) => !previous);
   };
 
+  const hasActionableInputs = useMemo(() => {
+    return rows.some((row) => {
+      const normalized = ensureRowInitialized(row);
+      const status =
+        typeof normalized.status === "string" ? normalized.status.trim() : "";
+      const trimmedInputLength = normalized.input.trim().length;
+
+      switch (status) {
+        case "In Progress":
+          return true;
+        case "Pending":
+          return trimmedInputLength > 0;
+        case "Error": {
+          const retries = typeof normalized.retries === "number" ? normalized.retries : 0;
+          return trimmedInputLength > 0 && retries < 3;
+        }
+        default:
+          return false;
+      }
+    });
+  }, [rows]);
+
+  useEffect(() => {
+    if (!systemActive) {
+      return;
+    }
+
+    if (!hasActionableInputs) {
+      setSystemActive(false);
+    }
+  }, [hasActionableInputs, systemActive]);
+
   const { pending, inProgress, complete, totalCost, percentages, completionRatios } = useMemo(() => {
     let pendingCount = 0;
     let inProgressCount = 0;

@@ -314,4 +314,78 @@ describe("HomeContent", () => {
       expect.arrayContaining([expect.objectContaining({ status: "Complete" })]),
     );
   });
+
+  it("auto-disables generation when no actionable inputs exist", async () => {
+    const init = await ensureRowInitialized();
+    gridRepositoryMock.__setRows([
+      init({ rowId: "done", status: "Complete", input: "finished", output: "ok" }),
+      init({ rowId: "blank", status: "Pending", input: "" }),
+    ]);
+
+    const HomeContent = await loadHomeContent();
+    render(<HomeContent />);
+
+    const toggle = await screen.findByRole("button", { name: /generation/i });
+    await userEvent.click(toggle);
+
+    await waitFor(() => {
+      expect(toggle).toHaveAttribute("aria-pressed", "false");
+    });
+  });
+
+  it("turns off generation when only exhausted error rows remain", async () => {
+    const init = await ensureRowInitialized();
+    gridRepositoryMock.__setRows([
+      init({ rowId: "err", status: "Error", retries: 3, input: "still broken" }),
+    ]);
+
+    const HomeContent = await loadHomeContent();
+    render(<HomeContent />);
+
+    const toggle = await screen.findByRole("button", { name: /generation/i });
+    await userEvent.click(toggle);
+
+    await waitFor(() => {
+      expect(toggle).toHaveAttribute("aria-pressed", "false");
+    });
+  });
+
+  it("turns off generation after the final pending row completes", async () => {
+    const intervalCallbacks: Array<() => void> = [];
+    vi.spyOn(Math, "random").mockReturnValue(0.9);
+    vi.spyOn(window, "setInterval").mockImplementation((callback: TimerHandler) => {
+      const fn = callback as () => void;
+      intervalCallbacks.push(fn);
+      return 1 as unknown as number;
+    });
+    vi.spyOn(window, "clearInterval").mockImplementation(() => {});
+
+    const init = await ensureRowInitialized();
+    gridRepositoryMock.__setRows([
+      init({ rowId: "pending-final", status: "Pending", input: "process me" }),
+    ]);
+
+    const HomeContent = await loadHomeContent();
+    render(<HomeContent />);
+
+    const toggle = await screen.findByRole("button", { name: /generation/i });
+    await userEvent.click(toggle);
+    expect(toggle).toHaveAttribute("aria-pressed", "true");
+
+    await act(async () => {
+      intervalCallbacks.forEach((callback) => callback());
+    });
+
+    await act(async () => {
+      intervalCallbacks.forEach((callback) => callback());
+    });
+
+    await waitFor(() => {
+      expect(gridRepositoryMock.saveGridRows).toHaveBeenCalled();
+    });
+
+    await waitFor(() => {
+      expect(toggle).toHaveAttribute("aria-pressed", "false");
+    });
+  });
 });
