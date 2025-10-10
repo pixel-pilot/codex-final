@@ -25,12 +25,7 @@ import {
   subscribeToGridRows,
 } from "../../lib/gridRepository";
 import { loadSettingsState, subscribeToSettingsState } from "../../lib/settingsRepository";
-import {
-  loadSystemState,
-  saveSystemState,
-  subscribeToSystemState,
-  type PersistedSystemState,
-} from "../../lib/systemRepository";
+import { writeTextToClipboard } from "../../lib/clipboard";
 
 type TabId = "generate" | "settings" | "usage" | "updates";
 
@@ -245,83 +240,32 @@ export default function HomeContent() {
     report: null,
     error: null,
   });
-  const updatesLoading = useUpdatesStore((state) => state.loading);
-  const updatesError = useUpdatesStore((state) => state.error);
-  const updatesRefresh = useUpdatesStore((state) => state.refresh);
+  const [actionAnnouncement, setActionAnnouncement] = useState("");
   const lastPersistedRows = useRef<string | null>(null);
   const lastPersistedWidths = useRef<string | null>(null);
   const lastPersistedErrorLog = useRef<string | null>(null);
-  const systemSyncRequestIdRef = useRef(0);
-  const confirmedSystemStateRef = useRef(false);
-  const failedSystemTargetRef = useRef<boolean | null>(null);
-  const hasAppliedInitialSystemStateRef = useRef(false);
+  const actionAnnouncementTimeoutRef = useRef<number | null>(null);
 
-  const commitSystemState = useCallback((payload: PersistedSystemState) => {
-    confirmedSystemStateRef.current = payload.active;
-    hasAppliedInitialSystemStateRef.current = true;
-    setSystemActive(payload.active);
-    setSystemSyncState("idle");
-    setSystemSyncMessage(null);
-    setSystemHydrated(true);
+  const announceAction = useCallback((message: string) => {
+    if (actionAnnouncementTimeoutRef.current !== null) {
+      window.clearTimeout(actionAnnouncementTimeoutRef.current);
+      actionAnnouncementTimeoutRef.current = null;
+    }
+
+    setActionAnnouncement(message);
+
+    if (message) {
+      actionAnnouncementTimeoutRef.current = window.setTimeout(() => {
+        setActionAnnouncement("");
+        actionAnnouncementTimeoutRef.current = null;
+      }, 2600);
+    }
   }, []);
 
   useEffect(() => {
-    let cancelled = false;
-
-    const applySystemState = (
-      payload: PersistedSystemState | null,
-      source: "hydrate" | "subscription",
-    ) => {
-      if (!payload) {
-        return;
-      }
-
-      if (source === "hydrate" && systemSyncRequestIdRef.current > 0) {
-        return;
-      }
-
-      if (cancelled) {
-        return;
-      }
-
-      commitSystemState(payload);
-    };
-
-    const hydrateSystemState = async () => {
-      try {
-        const stored = await loadSystemState();
-        if (!cancelled && stored) {
-          applySystemState(stored, "hydrate");
-        }
-      } catch (error) {
-        console.error("Unable to hydrate system status", error);
-        if (!cancelled) {
-          setSystemSyncState("error");
-          setSystemSyncMessage(SYSTEM_SYNC_ERROR_MESSAGE);
-        }
-      } finally {
-        if (!cancelled) {
-          setSystemHydrated(true);
-        }
-      }
-    };
-
-    void hydrateSystemState();
-
-    const unsubscribe = subscribeToSystemState((payload) => {
-      if (cancelled) {
-        return;
-      }
-
-      if (payload) {
-        applySystemState(payload, hasAppliedInitialSystemStateRef.current ? "subscription" : "hydrate");
-      }
-    });
-
     return () => {
-      cancelled = true;
-      if (typeof unsubscribe === "function") {
-        unsubscribe();
+      if (actionAnnouncementTimeoutRef.current !== null) {
+        window.clearTimeout(actionAnnouncementTimeoutRef.current);
       }
     };
   }, []);
@@ -780,6 +724,53 @@ export default function HomeContent() {
     });
   }, [selectedRowIds]);
 
+  const handleCopySelectedValues = useCallback(
+    async (field: "input" | "output") => {
+      if (!selectedRowIds.size) {
+        announceAction(
+          `Select rows to copy ${field === "input" ? "inputs" : "outputs"}.`,
+        );
+        return;
+      }
+
+      const selectedRows = rows.filter((row) => selectedRowIds.has(row.rowId));
+      if (!selectedRows.length) {
+        announceAction(
+          `Selected rows are outside the current filter. Adjust filters to copy ${
+            field === "input" ? "inputs" : "outputs"
+          }.`,
+        );
+        return;
+      }
+
+      const normalized = selectedRows.map((row) => ensureRowInitialized(row)[field] ?? "");
+      const payload = normalized.join("\n");
+      const pluralLabel = field === "input" ? "inputs" : "outputs";
+      const capitalizedLabel = field === "input" ? "Inputs" : "Outputs";
+
+      try {
+        const success = await writeTextToClipboard(payload);
+        if (success) {
+          const hasContent = normalized.some((value) => value.trim().length > 0);
+          const rowLabel = `row${selectedRows.length === 1 ? "" : "s"}`;
+          if (hasContent) {
+            announceAction(
+              `${capitalizedLabel} copied for ${selectedRows.length.toLocaleString()} ${rowLabel}.`,
+            );
+          } else {
+            announceAction(`Copied ${pluralLabel}, but they are currently empty.`);
+          }
+        } else {
+          announceAction(`Unable to access the clipboard. ${capitalizedLabel} not copied.`);
+        }
+      } catch (error) {
+        console.error(`Unable to copy ${pluralLabel}`, error);
+        announceAction(`Unable to copy ${pluralLabel}. Try again or copy manually.`);
+      }
+    },
+    [announceAction, rows, selectedRowIds],
+  );
+
   const handleClearErrorLog = useCallback(() => {
     if (!errorLog.length) {
       return;
@@ -1001,6 +992,38 @@ export default function HomeContent() {
       window.clearInterval(interval);
     };
   }, [refreshQaReport]);
+
+  const hasActionableInputs = useMemo(() => {
+    return rows.some((row) => {
+      const normalized = ensureRowInitialized(row);
+      const status =
+        typeof normalized.status === "string" ? normalized.status.trim() : "";
+      const trimmedInputLength = normalized.input.trim().length;
+
+      switch (status) {
+        case "In Progress":
+          return true;
+        case "Pending":
+          return trimmedInputLength > 0;
+        case "Error": {
+          const retries = typeof normalized.retries === "number" ? normalized.retries : 0;
+          return trimmedInputLength > 0 && retries < 3;
+        }
+        default:
+          return false;
+      }
+    });
+  }, [rows]);
+
+  useEffect(() => {
+    if (!systemActive) {
+      return;
+    }
+
+    if (!hasActionableInputs) {
+      setSystemActive(false);
+    }
+  }, [hasActionableInputs, systemActive]);
 
   const { pending, inProgress, complete, totalCost, percentages, completionRatios } = useMemo(() => {
     let pendingCount = 0;
@@ -1404,6 +1427,32 @@ export default function HomeContent() {
             <button
               type="button"
               className="grid-action-button"
+              onClick={() => {
+                void handleCopySelectedValues("input");
+              }}
+              title="Copy input text from all selected rows to the clipboard."
+              aria-label="Copy all inputs. Copies input text from all selected rows to the clipboard."
+              disabled={!selectedCount}
+            >
+              Copy All Inputs
+              <span className="grid-action-button__hint" aria-hidden="true">?</span>
+            </button>
+            <button
+              type="button"
+              className="grid-action-button"
+              onClick={() => {
+                void handleCopySelectedValues("output");
+              }}
+              title="Copy generated output from all selected rows to the clipboard."
+              aria-label="Copy all outputs. Copies generated output from all selected rows to the clipboard."
+              disabled={!selectedCount}
+            >
+              Copy All Outputs
+              <span className="grid-action-button__hint" aria-hidden="true">?</span>
+            </button>
+            <button
+              type="button"
+              className="grid-action-button"
               onClick={handleClearSelectedInputs}
               title="Remove input text from all selected rows."
               aria-label="Clear all inputs. Removes input text from all selected rows."
@@ -1445,6 +1494,9 @@ export default function HomeContent() {
               Deselect All
               <span className="grid-action-button__hint" aria-hidden="true">?</span>
             </button>
+            <div className="sr-only" aria-live="polite">
+              {actionAnnouncement}
+            </div>
           </div>
         </div>
         <div className="grid-container" aria-label="AI grid workspace">

@@ -4,6 +4,19 @@ import userEvent from "@testing-library/user-event";
 import { act } from "react";
 import { useUpdatesStore } from "../../stores/updatesStore";
 
+const writeTextToClipboardMock = vi.fn(async (_text: string) => true);
+
+vi.mock("../../../lib/clipboard", async () => {
+  const actual = await vi.importActual<typeof import("../../../lib/clipboard")>(
+    "../../../lib/clipboard",
+  );
+
+  return {
+    ...actual,
+    writeTextToClipboard: writeTextToClipboardMock,
+  };
+});
+
 vi.mock("../CoreGrid", async () => {
   const actual = await vi.importActual<typeof import("../CoreGrid")>("../CoreGrid");
 
@@ -242,6 +255,7 @@ describe("HomeContent", () => {
         },
       ),
     );
+    writeTextToClipboardMock.mockClear();
   });
 
   it("hydrates saved rows, updates metrics, and persists changes", async () => {
@@ -324,6 +338,31 @@ describe("HomeContent", () => {
     expect(screen.getByText(/selected/)).toHaveTextContent("2");
   });
 
+  it("copies selected inputs and outputs via action shortcuts", async () => {
+    const init = await ensureRowInitialized();
+    gridRepositoryMock.__setRows([
+      init({ rowId: "row-1", status: "Pending", input: "alpha", output: "" }),
+      init({ rowId: "row-2", status: "Complete", input: "beta", output: "gamma" }),
+    ]);
+
+    const HomeContent = await loadHomeContent();
+    render(<HomeContent />);
+
+    await screen.findByTestId("core-grid-mock");
+
+    const selectAll = screen.getByTestId("select-all");
+    await userEvent.click(selectAll);
+
+    const copyInputsButton = screen.getByRole("button", { name: /copy all inputs/i });
+    await userEvent.click(copyInputsButton);
+    expect(writeTextToClipboardMock).toHaveBeenCalledWith("alpha\nbeta");
+
+    writeTextToClipboardMock.mockClear();
+    const copyOutputsButton = screen.getByRole("button", { name: /copy all outputs/i });
+    await userEvent.click(copyOutputsButton);
+    expect(writeTextToClipboardMock).toHaveBeenCalledWith("\ngamma");
+  });
+
   it("advances generation state when the system toggle is enabled", async () => {
     const intervalCallbacks: Array<() => void> = [];
     vi.spyOn(Math, "random").mockReturnValue(0.9);
@@ -375,153 +414,77 @@ describe("HomeContent", () => {
     );
   });
 
-  it("surfaces syncing and retry states when persisting the toggle fails", async () => {
-    let rejectSync: ((error: Error) => void) | null = null;
-    systemRepositoryMock.saveSystemState.mockImplementationOnce(
-      () =>
-        new Promise((_, reject) => {
-          rejectSync = reject as (error: Error) => void;
-        }),
-    );
+  it("auto-disables generation when no actionable inputs exist", async () => {
+    const init = await ensureRowInitialized();
+    gridRepositoryMock.__setRows([
+      init({ rowId: "done", status: "Complete", input: "finished", output: "ok" }),
+      init({ rowId: "blank", status: "Pending", input: "" }),
+    ]);
 
     const HomeContent = await loadHomeContent();
     render(<HomeContent />);
 
-    const tabNavigation = screen.getByRole("navigation", { name: /primary views/i });
-    const generateTabButton = within(tabNavigation).getByRole("button", { name: /generate/i });
     const toggle = await screen.findByRole("button", { name: /generation/i });
     await userEvent.click(toggle);
 
     await waitFor(() => {
-      expect(toggle).toHaveAttribute("aria-busy", "true");
+      expect(toggle).toHaveAttribute("aria-pressed", "false");
+    });
+  });
+
+  it("turns off generation when only exhausted error rows remain", async () => {
+    const init = await ensureRowInitialized();
+    gridRepositoryMock.__setRows([
+      init({ rowId: "err", status: "Error", retries: 3, input: "still broken" }),
+    ]);
+
+    const HomeContent = await loadHomeContent();
+    render(<HomeContent />);
+
+    const toggle = await screen.findByRole("button", { name: /generation/i });
+    await userEvent.click(toggle);
+
+    await waitFor(() => {
+      expect(toggle).toHaveAttribute("aria-pressed", "false");
+    });
+  });
+
+  it("turns off generation after the final pending row completes", async () => {
+    const intervalCallbacks: Array<() => void> = [];
+    vi.spyOn(Math, "random").mockReturnValue(0.9);
+    vi.spyOn(window, "setInterval").mockImplementation((callback: TimerHandler) => {
+      const fn = callback as () => void;
+      intervalCallbacks.push(fn);
+      return 1 as unknown as number;
+    });
+    vi.spyOn(window, "clearInterval").mockImplementation(() => {});
+
+    const init = await ensureRowInitialized();
+    gridRepositoryMock.__setRows([
+      init({ rowId: "pending-final", status: "Pending", input: "process me" }),
+    ]);
+
+    const HomeContent = await loadHomeContent();
+    render(<HomeContent />);
+
+    const toggle = await screen.findByRole("button", { name: /generation/i });
+    await userEvent.click(toggle);
+    expect(toggle).toHaveAttribute("aria-pressed", "true");
+
+    await act(async () => {
+      intervalCallbacks.forEach((callback) => callback());
     });
 
     await act(async () => {
-      rejectSync?.(new Error("network down"));
-      await Promise.resolve();
-    });
-
-    const alert = await screen.findByRole("alert");
-    expect(alert).toHaveTextContent(/unable to sync changes/i);
-    expect(toggle).toHaveAttribute("aria-pressed", "false");
-
-    expect(generateTabButton).toHaveClass("tab-navigation__button--error");
-
-    const retryButton = within(alert).getByRole("button", { name: /retry/i });
-    await userEvent.click(retryButton);
-
-    await waitFor(() => {
-      expect(systemRepositoryMock.saveSystemState).toHaveBeenCalledTimes(2);
+      intervalCallbacks.forEach((callback) => callback());
     });
 
     await waitFor(() => {
-      expect(toggle).toHaveAttribute("aria-busy", "false");
+      expect(gridRepositoryMock.saveGridRows).toHaveBeenCalled();
     });
-    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
-    expect(generateTabButton).not.toHaveClass("tab-navigation__button--error");
-  });
-
-  it("allows manual refresh on the generate tab and rehydrates persisted data", async () => {
-    const HomeContent = await loadHomeContent();
-    render(<HomeContent />);
-
-    const refreshButton = await screen.findByRole("button", {
-      name: /refresh generate view/i,
-    });
-
-    gridRepositoryMock.loadGridRows.mockClear();
-    gridRepositoryMock.loadColumnWidths.mockClear();
-    gridRepositoryMock.loadErrorLog.mockClear();
-    systemRepositoryMock.loadSystemState.mockClear();
-
-    systemRepositoryMock.__setState({
-      active: true,
-      updatedAt: new Date().toISOString(),
-    });
-    gridRepositoryMock.__setRows([]);
-
-    await userEvent.click(refreshButton);
 
     await waitFor(() => {
-      expect(screen.getByRole("button", { name: /refresh generate view/i })).toHaveTextContent(
-        "Refresh",
-      );
+      expect(toggle).toHaveAttribute("aria-pressed", "false");
     });
-
-    expect(systemRepositoryMock.loadSystemState).toHaveBeenCalledTimes(1);
-    expect(gridRepositoryMock.loadGridRows).toHaveBeenCalledTimes(1);
-    expect(gridRepositoryMock.loadColumnWidths).toHaveBeenCalledTimes(1);
-    expect(gridRepositoryMock.loadErrorLog).toHaveBeenCalledTimes(1);
-  });
-
-  it("shows an error message when manual refresh fails for generate", async () => {
-    const HomeContent = await loadHomeContent();
-    render(<HomeContent />);
-
-    const refreshButton = await screen.findByRole("button", {
-      name: /refresh generate view/i,
-    });
-
-    gridRepositoryMock.loadGridRows.mockImplementationOnce(async () => {
-      throw new Error("boom");
-    });
-
-    await userEvent.click(refreshButton);
-
-    await screen.findByText(/unable to refresh grid rows/i);
-    expect(
-      screen.getByRole("button", { name: /refresh generate view/i }),
-    ).toHaveTextContent("Refresh");
-  });
-
-  it("re-fetches QA coverage when manually refreshing the usage tab", async () => {
-    const HomeContent = await loadHomeContent();
-    render(<HomeContent />);
-
-    const usageTab = screen.getByRole("button", { name: /usage & costs/i });
-    await userEvent.click(usageTab);
-
-    await screen.findByRole("button", { name: /refresh usage & costs view/i });
-
-    const fetchMock = vi.mocked(globalThis.fetch);
-    fetchMock.mockClear();
-
-    await userEvent.click(screen.getByRole("button", { name: /refresh usage & costs view/i }));
-
-    await waitFor(() => {
-      expect(fetchMock).toHaveBeenCalledWith(
-        "/qa/latest.json",
-        expect.objectContaining({ cache: "no-store" }),
-      );
-    });
-  });
-
-  it("delegates manual refresh to the updates store", async () => {
-    const originalRefresh = useUpdatesStore.getState().refresh;
-    const refreshSpy = vi.fn(async () => {});
-
-    act(() => {
-      useUpdatesStore.setState((state) => ({ ...state, refresh: refreshSpy }));
-    });
-
-    try {
-      const HomeContent = await loadHomeContent();
-      render(<HomeContent />);
-
-      const updatesTab = screen.getByRole("button", { name: /updates/i });
-      await userEvent.click(updatesTab);
-
-      await screen.findByRole("button", { name: /refresh updates view/i });
-
-      await userEvent.click(screen.getByRole("button", { name: /refresh updates view/i }));
-
-      await waitFor(() => {
-        expect(refreshSpy).toHaveBeenCalledTimes(1);
-      });
-    } finally {
-      act(() => {
-        useUpdatesStore.setState((state) => ({ ...state, refresh: originalRefresh, error: null }));
-      });
-    }
   });
 });
