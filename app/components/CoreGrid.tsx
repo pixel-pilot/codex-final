@@ -3,6 +3,7 @@
 import {
   useCallback,
   useEffect,
+  useId,
   useMemo,
   useRef,
   useState,
@@ -13,7 +14,7 @@ import type {
   KeyboardEvent,
   MouseEvent as ReactMouseEvent,
 } from "react";
-import { extractClipboardValues } from "../../lib/clipboard";
+import { extractClipboardValues, writeTextToClipboard } from "../../lib/clipboard";
 
 export type GridRow = {
   rowId: string;
@@ -96,6 +97,32 @@ const calculateCost = (inputTokens: number, outputTokens: number) => {
   const unitCost = 0.000002;
 
   return Number((totalTokens * unitCost).toFixed(4));
+};
+
+const escapeHtml = (value: string): string => {
+  return value.replace(/[&<>"']/g, (character) => {
+    switch (character) {
+      case "&":
+        return "&amp;";
+      case "<":
+        return "&lt;";
+      case ">":
+        return "&gt;";
+      case '"':
+        return "&quot;";
+      case "'":
+        return "&#39;";
+      default:
+        return character;
+    }
+  });
+};
+
+const buildClipboardTableHtml = (values: string[]): string => {
+  const rows = values
+    .map((value) => `<tr><td>${escapeHtml(value)}</td></tr>`)
+    .join("");
+  return `<table><tbody>${rows}</tbody></table>`;
 };
 
 const withDerivedMetrics = (row: GridRow): GridRow => {
@@ -195,6 +222,14 @@ export function CoreGrid({
   const [activeRow, setActiveRow] = useState<number | null>(null);
   const [scrollTop, setScrollTop] = useState(0);
   const [viewportHeight, setViewportHeight] = useState(400);
+  const [copiedOutputRowIds, setCopiedOutputRowIds] = useState<Set<string>>(
+    () => new Set(),
+  );
+  const [copyAnnouncement, setCopyAnnouncement] = useState("");
+  const [outputPreview, setOutputPreview] = useState<
+    | { rowId: string; content: string; label: string }
+    | null
+  >(null);
 
   const containerRef = useRef<HTMLDivElement | null>(null);
   const inputRefs = useRef(new Map<string, HTMLTextAreaElement>());
@@ -203,6 +238,11 @@ export function CoreGrid({
     startX: number;
     startWidth: number;
   } | null>(null);
+  const copiedRowTimeoutRef = useRef<number | null>(null);
+  const announcementTimeoutRef = useRef<number | null>(null);
+  const previewCloseRef = useRef<HTMLButtonElement | null>(null);
+  const previewTitleId = useId();
+  const previewContentId = useMemo(() => `${previewTitleId}-content`, [previewTitleId]);
 
   const normalizedColumnWidths: ColumnWidths = useMemo(() => {
     const resolved: Partial<ColumnWidths> = {};
@@ -215,6 +255,41 @@ export function CoreGrid({
     }
     return resolved as ColumnWidths;
   }, [columnWidths]);
+
+  const markRowsAsCopied = useCallback((rowIds: string[]) => {
+    if (copiedRowTimeoutRef.current !== null) {
+      window.clearTimeout(copiedRowTimeoutRef.current);
+      copiedRowTimeoutRef.current = null;
+    }
+
+    if (!rowIds.length) {
+      setCopiedOutputRowIds(new Set());
+      return;
+    }
+
+    setCopiedOutputRowIds(new Set(rowIds));
+
+    copiedRowTimeoutRef.current = window.setTimeout(() => {
+      setCopiedOutputRowIds(new Set());
+      copiedRowTimeoutRef.current = null;
+    }, 2000);
+  }, []);
+
+  const announceCopyResult = useCallback((message: string) => {
+    if (announcementTimeoutRef.current !== null) {
+      window.clearTimeout(announcementTimeoutRef.current);
+      announcementTimeoutRef.current = null;
+    }
+
+    setCopyAnnouncement(message);
+
+    if (message) {
+      announcementTimeoutRef.current = window.setTimeout(() => {
+        setCopyAnnouncement("");
+        announcementTimeoutRef.current = null;
+      }, 2500);
+    }
+  }, []);
 
   useEffect(() => {
     const container = containerRef.current;
@@ -429,11 +504,207 @@ export function CoreGrid({
     [displayedRowIndices, setRows, totalRowCount],
   );
 
+  const copyOutputValue = useCallback(
+    async (row: GridRow) => {
+      const value = row.output ?? "";
+
+      if (!value.trim()) {
+        markRowsAsCopied([row.rowId]);
+        announceCopyResult("Output is empty.");
+        return;
+      }
+
+      try {
+        const success = await writeTextToClipboard(value);
+        if (success) {
+          markRowsAsCopied([row.rowId]);
+          announceCopyResult("Output copied to clipboard.");
+        } else {
+          announceCopyResult("Unable to access clipboard. Select the output text manually.");
+        }
+      } catch (error) {
+        console.error("Unable to copy output cell", error);
+        announceCopyResult("Unable to copy output. Select the output text manually.");
+      }
+    },
+    [announceCopyResult, markRowsAsCopied],
+  );
+
+  const handleOutputClick = useCallback(
+    (event: ReactMouseEvent<HTMLDivElement>, row: GridRow) => {
+      const selection = typeof window !== "undefined" ? window.getSelection() : null;
+      if (selection && selection.toString().trim().length > 0) {
+        return;
+      }
+
+      event.currentTarget.focus({ preventScroll: true });
+      void copyOutputValue(row);
+    },
+    [copyOutputValue],
+  );
+
+  const handleOutputDoubleClick = useCallback((row: GridRow, label: string) => {
+    setOutputPreview({ rowId: row.rowId, content: row.output ?? "", label });
+  }, []);
+
+  const closePreview = useCallback(() => {
+    setOutputPreview(null);
+  }, []);
+
+  const handlePreviewCopy = useCallback(async () => {
+    if (!outputPreview) {
+      return;
+    }
+
+    try {
+      const success = await writeTextToClipboard(outputPreview.content ?? "");
+      if (success) {
+        markRowsAsCopied([outputPreview.rowId]);
+        announceCopyResult("Output copied to clipboard.");
+      } else {
+        announceCopyResult("Unable to access clipboard. Select the output text manually.");
+      }
+    } catch (error) {
+      console.error("Unable to copy previewed output", error);
+      announceCopyResult("Unable to copy output. Select the output text manually.");
+    }
+  }, [announceCopyResult, markRowsAsCopied, outputPreview]);
+
+  const handleCopyCapture = useCallback(
+    (event: ClipboardEvent<HTMLDivElement>) => {
+      const clipboard = event.clipboardData;
+      if (!clipboard) {
+        return;
+      }
+
+      const selection = typeof window !== "undefined" ? window.getSelection() : null;
+      if (
+        !selection ||
+        selection.isCollapsed ||
+        typeof selection.containsNode !== "function"
+      ) {
+        return;
+      }
+
+      const container = containerRef.current;
+      if (!container) {
+        return;
+      }
+
+      const outputNodes = Array.from(
+        container.querySelectorAll<HTMLElement>('[data-cell-role="output"]'),
+      ).filter((node) => {
+        try {
+          return selection.containsNode(node, true);
+        } catch (error) {
+          console.warn("Unable to evaluate selection for node", error);
+          return false;
+        }
+      });
+
+      if (!outputNodes.length) {
+        return;
+      }
+
+      const uniqueRowIds = Array.from(
+        new Set(
+          outputNodes
+            .map((node) => {
+              const direct = node.getAttribute("data-row-id");
+              if (direct) {
+                return direct;
+              }
+              const ancestor = node.closest<HTMLElement>("[data-row-id]");
+              return ancestor?.dataset.rowId ?? null;
+            })
+            .filter((value): value is string => Boolean(value)),
+        ),
+      );
+
+      if (!uniqueRowIds.length) {
+        return;
+      }
+
+      const rowOutputMap = new Map<string, string>();
+      rows.forEach((row) => {
+        rowOutputMap.set(row.rowId, row.output ?? "");
+      });
+
+      const payloadValues = uniqueRowIds.map((rowId) => rowOutputMap.get(rowId) ?? "");
+
+      if (typeof clipboard.clearData === "function") {
+        clipboard.clearData();
+      }
+      clipboard.setData("text/plain", payloadValues.join("\n"));
+      clipboard.setData("text/html", buildClipboardTableHtml(payloadValues));
+      event.preventDefault();
+      event.stopPropagation();
+
+      markRowsAsCopied(uniqueRowIds);
+
+      const hasContent = payloadValues.some((value) => value.trim().length > 0);
+      if (hasContent) {
+        announceCopyResult(
+          `Outputs copied for ${uniqueRowIds.length.toLocaleString()} highlighted row${
+            uniqueRowIds.length === 1 ? "" : "s"
+          }.`,
+        );
+      } else {
+        announceCopyResult("Highlighted outputs copied, but they are empty.");
+      }
+    },
+    [announceCopyResult, markRowsAsCopied, rows],
+  );
+
   useEffect(() => {
     const container = containerRef.current;
     if (container) {
       setScrollTop(container.scrollTop);
     }
+  }, []);
+
+  useEffect(() => {
+    if (!outputPreview) {
+      return undefined;
+    }
+
+    if (typeof document !== "undefined") {
+      const previousOverflow = document.body.style.overflow;
+      document.body.style.overflow = "hidden";
+
+      const handleKeyDown = (event: globalThis.KeyboardEvent) => {
+        if (event.key === "Escape") {
+          event.preventDefault();
+          closePreview();
+        }
+      };
+
+      document.addEventListener("keydown", handleKeyDown);
+
+      return () => {
+        document.body.style.overflow = previousOverflow;
+        document.removeEventListener("keydown", handleKeyDown);
+      };
+    }
+
+    return undefined;
+  }, [closePreview, outputPreview]);
+
+  useEffect(() => {
+    if (outputPreview && previewCloseRef.current) {
+      previewCloseRef.current.focus();
+    }
+  }, [outputPreview]);
+
+  useEffect(() => {
+    return () => {
+      if (copiedRowTimeoutRef.current !== null) {
+        window.clearTimeout(copiedRowTimeoutRef.current);
+      }
+      if (announcementTimeoutRef.current !== null) {
+        window.clearTimeout(announcementTimeoutRef.current);
+      }
+    };
   }, []);
 
   const displayedRows = useMemo(() => {
@@ -563,6 +834,7 @@ export function CoreGrid({
       aria-rowcount={displayedRows.length}
       aria-colcount={columnDefinition.length}
       style={gridStyle}
+      onCopyCapture={handleCopyCapture}
     >
       <div className="grid-header" role="rowgroup">
         <div className="grid-header-row" role="row">
@@ -614,6 +886,9 @@ export function CoreGrid({
             const statusToneClass = statusMeta
               ? `status-select--${statusMeta.tone}`
               : "status-select--unknown";
+            const displayRowNumber = (actualRowIndex ?? rowIndex) + 1;
+            const previewLabel = `Output for row ${displayRowNumber}`;
+            const isOutputCopied = copiedOutputRowIds.has(row.rowId);
 
             return (
               <div
@@ -624,6 +899,7 @@ export function CoreGrid({
                 role="row"
                 aria-rowindex={rowIndex + 1}
                 style={{ transform: `translateY(${rowIndex * ROW_HEIGHT}px)` }}
+                data-row-id={row.rowId}
               >
                 <div className="grid-cell grid-cell--selection" role="gridcell" aria-colindex={1}>
                   <input
@@ -683,8 +959,55 @@ export function CoreGrid({
                     aria-label={`Input for row ${rowIndex + 1}`}
                   />
                 </div>
-                <div className="grid-cell" role="gridcell" aria-colindex={4}>
-                  {row.output}
+                <div
+                  className={`grid-cell grid-cell--output${
+                    isOutputCopied ? " grid-cell--copied" : ""
+                  }`}
+                  role="gridcell"
+                  aria-colindex={4}
+                  tabIndex={0}
+                  aria-label={`${previewLabel}. Click to copy. Double click to expand.`}
+                  title="Click to copy output. Double click to expand."
+                  onClick={(event) => handleOutputClick(event, row)}
+                  onDoubleClick={() => handleOutputDoubleClick(row, previewLabel)}
+                  onKeyDown={(event) => {
+                    if (
+                      (event.key === "Enter" &&
+                        (event.metaKey || event.ctrlKey || event.shiftKey)) ||
+                      event.key === "F2"
+                    ) {
+                      event.preventDefault();
+                      handleOutputDoubleClick(row, previewLabel);
+                      return;
+                    }
+
+                    if (event.key === "Enter" || event.key === " ") {
+                      event.preventDefault();
+                      void copyOutputValue(row);
+                      return;
+                    }
+
+                    if (
+                      (event.key === "c" || event.key === "C") &&
+                      (event.metaKey || event.ctrlKey)
+                    ) {
+                      event.preventDefault();
+                      void copyOutputValue(row);
+                    }
+                  }}
+                >
+                  <span
+                    className="grid-cell__text"
+                    data-cell-role="output"
+                    data-row-id={row.rowId}
+                    data-column-id="output"
+                  >
+                    {row.output ? (
+                      row.output
+                    ) : (
+                      <span className="grid-cell__placeholder">—</span>
+                    )}
+                  </span>
                 </div>
                 <div className="grid-cell read-only-dimmed" role="gridcell" aria-colindex={5}>
                   {row.len ?? ""}
@@ -701,8 +1024,60 @@ export function CoreGrid({
               </div>
             );
           })}
-        </div>
       </div>
+    </div>
+      <div className="sr-only" aria-live="polite">
+        {copyAnnouncement}
+      </div>
+      {outputPreview ? (
+        <div
+          className="grid-output-preview"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby={previewTitleId}
+          aria-describedby={previewContentId}
+          onMouseDown={(event) => {
+            if (event.target === event.currentTarget) {
+              closePreview();
+            }
+          }}
+        >
+          <div className="grid-output-preview__panel" role="document">
+            <header className="grid-output-preview__header">
+              <h3 id={previewTitleId}>{outputPreview.label}</h3>
+              <p className="grid-output-preview__subtitle">Row ID {outputPreview.rowId}</p>
+            </header>
+            <div className="grid-output-preview__actions">
+              <button
+                type="button"
+                className="grid-output-preview__button"
+                onClick={handlePreviewCopy}
+              >
+                Copy Output
+              </button>
+              <button
+                type="button"
+                className="grid-output-preview__button grid-output-preview__button--secondary"
+                onClick={closePreview}
+                ref={previewCloseRef}
+              >
+                Close
+              </button>
+            </div>
+            <div className="grid-output-preview__body">
+              <pre
+                id={previewContentId}
+                tabIndex={0}
+                className="grid-output-preview__content"
+              >
+                {outputPreview.content
+                  ? outputPreview.content
+                  : "No output generated for this row yet."}
+              </pre>
+            </div>
+          </div>
+        </div>
+      ) : null}
     </div>
   );
 }

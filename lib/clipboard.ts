@@ -1,4 +1,5 @@
-const BLOCK_LEVEL_SELECTOR = "div,p,li,ul,ol,pre,section,article,blockquote,header,footer,main,h1,h2,h3,h4,h5,h6";
+const BLOCK_LEVEL_SELECTOR =
+  "div,p,li,ul,ol,pre,section,article,blockquote,header,footer,main,h1,h2,h3,h4,h5,h6";
 
 const normalizeCellText = (value: string): string => {
   return value
@@ -155,3 +156,38 @@ export const extractClipboardValues = (clipboardData: DataTransfer | null): stri
 };
 
 export { parseHtmlTable as __parseHtmlTableForTesting, parsePlainText as __parsePlainTextForTesting };
+
+export const writeTextToClipboard = async (value: string): Promise<boolean> => {
+  const text = value ?? "";
+
+  try {
+    if (
+      typeof navigator !== "undefined" &&
+      navigator.clipboard &&
+      typeof navigator.clipboard.writeText === "function"
+    ) {
+      await navigator.clipboard.writeText(text);
+      return true;
+    }
+
+    if (typeof document === "undefined") {
+      return false;
+    }
+
+    const textarea = document.createElement("textarea");
+    textarea.value = text;
+    textarea.setAttribute("readonly", "");
+    textarea.style.position = "fixed";
+    textarea.style.opacity = "0";
+    textarea.style.pointerEvents = "none";
+    document.body.appendChild(textarea);
+    textarea.focus();
+    textarea.select();
+    const succeeded = document.execCommand("copy");
+    document.body.removeChild(textarea);
+    return succeeded;
+  } catch (error) {
+    console.error("Unable to write to clipboard", error);
+    return false;
+  }
+};

@@ -24,6 +24,7 @@ import {
   subscribeToGridRows,
 } from "../../lib/gridRepository";
 import { loadSettingsState, subscribeToSettingsState } from "../../lib/settingsRepository";
+import { writeTextToClipboard } from "../../lib/clipboard";
 
 type TabId = "generate" | "settings" | "usage" | "updates";
 
@@ -193,9 +194,35 @@ export default function HomeContent() {
     report: null,
     error: null,
   });
+  const [actionAnnouncement, setActionAnnouncement] = useState("");
   const lastPersistedRows = useRef<string | null>(null);
   const lastPersistedWidths = useRef<string | null>(null);
   const lastPersistedErrorLog = useRef<string | null>(null);
+  const actionAnnouncementTimeoutRef = useRef<number | null>(null);
+
+  const announceAction = useCallback((message: string) => {
+    if (actionAnnouncementTimeoutRef.current !== null) {
+      window.clearTimeout(actionAnnouncementTimeoutRef.current);
+      actionAnnouncementTimeoutRef.current = null;
+    }
+
+    setActionAnnouncement(message);
+
+    if (message) {
+      actionAnnouncementTimeoutRef.current = window.setTimeout(() => {
+        setActionAnnouncement("");
+        actionAnnouncementTimeoutRef.current = null;
+      }, 2600);
+    }
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      if (actionAnnouncementTimeoutRef.current !== null) {
+        window.clearTimeout(actionAnnouncementTimeoutRef.current);
+      }
+    };
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
@@ -660,6 +687,53 @@ export default function HomeContent() {
     });
   }, [selectedRowIds]);
 
+  const handleCopySelectedValues = useCallback(
+    async (field: "input" | "output") => {
+      if (!selectedRowIds.size) {
+        announceAction(
+          `Select rows to copy ${field === "input" ? "inputs" : "outputs"}.`,
+        );
+        return;
+      }
+
+      const selectedRows = rows.filter((row) => selectedRowIds.has(row.rowId));
+      if (!selectedRows.length) {
+        announceAction(
+          `Selected rows are outside the current filter. Adjust filters to copy ${
+            field === "input" ? "inputs" : "outputs"
+          }.`,
+        );
+        return;
+      }
+
+      const normalized = selectedRows.map((row) => ensureRowInitialized(row)[field] ?? "");
+      const payload = normalized.join("\n");
+      const pluralLabel = field === "input" ? "inputs" : "outputs";
+      const capitalizedLabel = field === "input" ? "Inputs" : "Outputs";
+
+      try {
+        const success = await writeTextToClipboard(payload);
+        if (success) {
+          const hasContent = normalized.some((value) => value.trim().length > 0);
+          const rowLabel = `row${selectedRows.length === 1 ? "" : "s"}`;
+          if (hasContent) {
+            announceAction(
+              `${capitalizedLabel} copied for ${selectedRows.length.toLocaleString()} ${rowLabel}.`,
+            );
+          } else {
+            announceAction(`Copied ${pluralLabel}, but they are currently empty.`);
+          }
+        } else {
+          announceAction(`Unable to access the clipboard. ${capitalizedLabel} not copied.`);
+        }
+      } catch (error) {
+        console.error(`Unable to copy ${pluralLabel}`, error);
+        announceAction(`Unable to copy ${pluralLabel}. Try again or copy manually.`);
+      }
+    },
+    [announceAction, rows, selectedRowIds],
+  );
+
   const handleClearErrorLog = useCallback(() => {
     if (!errorLog.length) {
       return;
@@ -1055,6 +1129,32 @@ export default function HomeContent() {
             <button
               type="button"
               className="grid-action-button"
+              onClick={() => {
+                void handleCopySelectedValues("input");
+              }}
+              title="Copy input text from all selected rows to the clipboard."
+              aria-label="Copy all inputs. Copies input text from all selected rows to the clipboard."
+              disabled={!selectedCount}
+            >
+              Copy All Inputs
+              <span className="grid-action-button__hint" aria-hidden="true">?</span>
+            </button>
+            <button
+              type="button"
+              className="grid-action-button"
+              onClick={() => {
+                void handleCopySelectedValues("output");
+              }}
+              title="Copy generated output from all selected rows to the clipboard."
+              aria-label="Copy all outputs. Copies generated output from all selected rows to the clipboard."
+              disabled={!selectedCount}
+            >
+              Copy All Outputs
+              <span className="grid-action-button__hint" aria-hidden="true">?</span>
+            </button>
+            <button
+              type="button"
+              className="grid-action-button"
               onClick={handleClearSelectedInputs}
               title="Remove input text from all selected rows."
               aria-label="Clear all inputs. Removes input text from all selected rows."
@@ -1096,6 +1196,9 @@ export default function HomeContent() {
               Deselect All
               <span className="grid-action-button__hint" aria-hidden="true">?</span>
             </button>
+            <div className="sr-only" aria-live="polite">
+              {actionAnnouncement}
+            </div>
           </div>
         </div>
         <div className="grid-container" aria-label="AI grid workspace">
