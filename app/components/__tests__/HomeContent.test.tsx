@@ -68,6 +68,7 @@ vi.mock("../CoreGrid", async () => {
 
 type GridRepositoryModule = typeof import("../../../lib/gridRepository");
 type SystemRepositoryModule = typeof import("../../../lib/systemRepository");
+type UsageLogRepositoryModule = typeof import("../../../lib/usageLogRepository");
 
 const createGridRepositoryMock = () => {
   let rows: Array<any> = [];
@@ -186,6 +187,69 @@ const systemRepositoryMock = createSystemRepositoryMock();
 
 vi.mock("../../../lib/systemRepository", () => systemRepositoryMock);
 
+const createUsageLogRepositoryMock = () => {
+  let entries: Array<any> = [];
+  const listeners = new Set<(next: any[]) => void>();
+
+  const loadUsageLog = vi.fn<
+    ReturnType<UsageLogRepositoryModule["loadUsageLog"]>,
+    Parameters<UsageLogRepositoryModule["loadUsageLog"]>
+  >();
+  const saveUsageLog = vi.fn<
+    ReturnType<UsageLogRepositoryModule["saveUsageLog"]>,
+    Parameters<UsageLogRepositoryModule["saveUsageLog"]>
+  >();
+  const subscribeToUsageLog = vi.fn<
+    ReturnType<UsageLogRepositoryModule["subscribeToUsageLog"]>,
+    Parameters<UsageLogRepositoryModule["subscribeToUsageLog"]>
+  >();
+
+  const applyDefaultImplementation = () => {
+    loadUsageLog.mockImplementation(async () => entries);
+    saveUsageLog.mockImplementation(async (payload: any[]) => {
+      entries = payload;
+      listeners.forEach((listener) => listener(payload));
+    });
+    subscribeToUsageLog.mockImplementation((handler: (payload: any[]) => void) => {
+      listeners.add(handler);
+      return () => {
+        listeners.delete(handler);
+      };
+    });
+  };
+
+  applyDefaultImplementation();
+
+  return {
+    loadUsageLog,
+    saveUsageLog,
+    subscribeToUsageLog,
+    __set(next: any[]) {
+      entries = next;
+    },
+    __emit(next: any[]) {
+      entries = next;
+      listeners.forEach((listener) => listener(next));
+    },
+    __reset() {
+      entries = [];
+      listeners.clear();
+      loadUsageLog.mockReset();
+      saveUsageLog.mockReset();
+      subscribeToUsageLog.mockReset();
+      applyDefaultImplementation();
+    },
+  } satisfies Partial<UsageLogRepositoryModule> & {
+    __set: (next: any[]) => void;
+    __emit: (next: any[]) => void;
+    __reset: () => void;
+  };
+};
+
+const usageLogRepositoryMock = createUsageLogRepositoryMock();
+
+vi.mock("../../../lib/usageLogRepository", () => usageLogRepositoryMock);
+
 vi.mock("../UpdatesPanel", () => ({
   __esModule: true,
   default: () => <div data-testid="updates-panel-mock" />,
@@ -236,6 +300,7 @@ describe("HomeContent", () => {
   beforeEach(() => {
     gridRepositoryMock.__reset();
     systemRepositoryMock.__reset();
+    usageLogRepositoryMock.__reset();
     settingsState = null;
     settingsListeners.clear();
     vi.restoreAllMocks();
